@@ -31,7 +31,15 @@ jobs:
     if: github.event.issue.pull_request != null
     runs-on: self-hosted
 
+    # Environment-based deployment protection
+    # Production deployments require manual approval from designated reviewers
+    # Staging deployments proceed automatically after validation
+    environment:
+      name: ${{ github.event.comment.body == '[prod]' && 'production' || 'staging' }}
+      url: ${{ github.event.comment.body == '[prod]' && 'http://localhost:8002' || 'http://localhost:8001' }}
+
     # Prevent runaway deployments - fail if job exceeds 15 minutes
+    # Note: For production, this timeout includes time waiting for manual approval
     timeout-minutes: 15
 
     steps:
@@ -68,6 +76,7 @@ jobs:
             ];
 
             const productionAuthorizedUsers = [
+             'ktamvada-cyber',  // repository owner
               'gromag'           // ONLY gromag can deploy to production (strict)
             ];
 
