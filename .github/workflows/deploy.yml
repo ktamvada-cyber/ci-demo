@@ -196,11 +196,80 @@ jobs:
           ref: ${{ steps.validate.outputs.pr_sha }}
           fetch-depth: 1
 
-      # STEP 4: Deploy to Staging Environment
+      # STEP 4: Check if same version is already deployed
+      # Skip deployment if the exact same SHA is already running
+      # Prevents unnecessary downtime and resource waste
+      - name: Check Already Deployed
+        id: check_deployed
+        if: steps.validate.outputs.should_deploy == 'true'
+        env:
+          COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
+          ENVIRONMENT: ${{ steps.validate.outputs.environment }}
+        run: |
+          CONTAINER_NAME="myapp-${ENVIRONMENT}"
+
+          # Check if container exists and is running
+          if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            # Get the image name/tag of the running container
+            RUNNING_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME})
+            TARGET_IMAGE="ci-demo:${COMMIT_SHA}"
+
+            if [ "$RUNNING_IMAGE" = "$TARGET_IMAGE" ]; then
+              echo "already_deployed=true" >> $GITHUB_OUTPUT
+              echo "✅ Same version already deployed: ${COMMIT_SHA}"
+              echo "⏭️  Skipping deployment (no changes)"
+              exit 0
+            else
+              echo "already_deployed=false" >> $GITHUB_OUTPUT
+              echo "🔄 Different version detected"
+              echo "   Current: ${RUNNING_IMAGE}"
+              echo "   Target:  ${TARGET_IMAGE}"
+            fi
+          else
+            echo "already_deployed=false" >> $GITHUB_OUTPUT
+            echo "📭 No existing container found"
+          fi
+
+      # STEP 5: Post already-deployed notification
+      # Informs user that deployment was skipped because same version is running
+      - name: Post Already Deployed Status
+        if: steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const environment = '${{ steps.validate.outputs.environment }}';
+            const sha = '${{ steps.validate.outputs.pr_sha }}';
+            const port = environment === 'staging' ? '8001' : '8002';
+            const containerName = environment === 'staging' ? 'myapp-staging' : 'myapp-prod';
+
+            const comment = `### ℹ️ Deployment Skipped (Already Running)
+
+            **Environment:** \`${environment}\`
+            **Status:** Already Deployed
+            **Commit SHA:** \`${sha}\`
+            **Container:** \`${containerName}\`
+            **Port:** \`${port}\`
+
+            ---
+            ✅ This exact version is already running in ${environment}.
+
+            🌐 **Access:** http://localhost:${port}/
+
+            💡 **Note:** No deployment needed - skipping to avoid unnecessary downtime.
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+      # STEP 6: Deploy to Staging Environment
       # Builds new Docker image tagged with commit SHA
       # Stops and removes any existing staging container
       - name: Deploy to Staging
-        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'staging'
+        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'staging' && steps.check_deployed.outputs.already_deployed != 'true'
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
           ENVIRONMENT: staging
@@ -251,7 +320,7 @@ jobs:
             exit 1
           fi
 
-      # STEP 5: Verify Staging Image Exists (Production Pre-Check)
+      # STEP 7: Verify Staging Image Exists (Production Pre-Check)
       # PRODUCTION IMAGE IMMUTABILITY:
       # Production MUST NOT rebuild the Docker image. Here's why:
       #
@@ -271,7 +340,7 @@ jobs:
       # Therefore, production deployment FAILS if the staging image does not exist.
       # This enforces the staging-first workflow and prevents untested production deployments.
       - name: Verify Staging Image Exists
-        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production'
+        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production' && steps.check_deployed.outputs.already_deployed != 'true'
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
         run: |
@@ -295,11 +364,11 @@ jobs:
 
           echo "✅ Staging image verified: ci-demo:${COMMIT_SHA}"
 
-      # STEP 6: Deploy to Production Environment
+      # STEP 8: Deploy to Production Environment
       # DOES NOT rebuild image - uses existing staging image
       # Stops and removes any existing production container
       - name: Deploy to Production
-        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production'
+        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production' && steps.check_deployed.outputs.already_deployed != 'true'
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
           ENVIRONMENT: production
@@ -344,10 +413,10 @@ jobs:
             exit 1
           fi
 
-      # STEP 7: Post deployment status comment to PR
-      # Runs always (success or failure) if validation passed
+      # STEP 9: Post deployment status comment to PR
+      # Runs always (success or failure) if validation passed and deployment was attempted
       - name: Post Deployment Status
-        if: always() && steps.validate.outputs.should_deploy == 'true'
+        if: always() && steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed != 'true'
         uses: actions/github-script@v7
         with:
           script: |
