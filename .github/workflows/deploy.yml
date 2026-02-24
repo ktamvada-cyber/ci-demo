@@ -196,7 +196,25 @@ jobs:
           ref: ${{ steps.validate.outputs.pr_sha }}
           fetch-depth: 1
 
-      # STEP 4: Check if same version is already deployed
+      # STEP 4: Capture Build Metadata
+      # Record deployment metadata for tracking and observability
+      - name: Capture Build Metadata
+        id: build_metadata
+        if: steps.validate.outputs.should_deploy == 'true'
+        run: |
+          # Capture build timestamp in ISO 8601 format
+          BUILD_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "build_timestamp=${BUILD_TIMESTAMP}" >> $GITHUB_OUTPUT
+          echo "📅 Build Timestamp: ${BUILD_TIMESTAMP}"
+
+          # Deployment ID is the GitHub run ID
+          echo "deployment_id=${{ github.run_id }}" >> $GITHUB_OUTPUT
+          echo "🆔 Deployment ID: ${{ github.run_id }}"
+
+          # Full 40-character commit SHA (already provided by validation step)
+          echo "✅ Full Commit SHA: ${{ steps.validate.outputs.pr_sha }}"
+
+      # STEP 5: Check if same version is already deployed
       # Skip deployment if the exact same SHA is already running
       # Prevents unnecessary downtime and resource waste
       - name: Check Already Deployed
@@ -230,7 +248,7 @@ jobs:
             echo "📭 No existing container found"
           fi
 
-      # STEP 5: Post already-deployed notification
+      # STEP 6: Post already-deployed notification
       # Informs user that deployment was skipped because same version is running
       - name: Post Already Deployed Status
         if: steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed == 'true'
@@ -239,21 +257,30 @@ jobs:
           script: |
             const environment = '${{ steps.validate.outputs.environment }}';
             const sha = '${{ steps.validate.outputs.pr_sha }}';
+            const buildTimestamp = '${{ steps.build_metadata.outputs.build_timestamp }}';
+            const deploymentId = '${{ steps.build_metadata.outputs.deployment_id }}';
             const port = environment === 'staging' ? '8001' : '8002';
             const containerName = environment === 'staging' ? 'myapp-staging' : 'myapp-prod';
 
             const comment = `### ℹ️ Deployment Skipped (Already Running)
 
-            **Environment:** \`${environment}\`
-            **Status:** Already Deployed
-            **Commit SHA:** \`${sha}\`
-            **Container:** \`${containerName}\`
-            **Port:** \`${port}\`
+            #### 📋 Current Deployment
+            | Field | Value |
+            |-------|-------|
+            | **Environment** | \`${environment}\` |
+            | **Status** | Already Deployed |
+            | **Commit SHA** | \`${sha}\` |
+            | **Check Timestamp** | \`${buildTimestamp}\` |
+            | **Check ID** | \`${deploymentId}\` |
+            | **Container** | \`${containerName}\` |
+            | **Port** | \`${port}\` |
 
             ---
             ✅ This exact version is already running in ${environment}.
 
-            🌐 **Access:** http://localhost:${port}/
+            #### 🌐 Access Information
+            **URL:** http://localhost:${port}/
+            **Workflow Run:** [View Logs](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
 
             💡 **Note:** No deployment needed - skipping to avoid unnecessary downtime.
             `;
@@ -265,10 +292,11 @@ jobs:
               body: comment
             });
 
-      # STEP 6: Deploy to Staging Environment
+      # STEP 7: Deploy to Staging Environment
       # Builds new Docker image tagged with commit SHA
       # Stops and removes any existing staging container
       - name: Deploy to Staging
+        id: deploy_staging
         if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'staging' && steps.check_deployed.outputs.already_deployed != 'true'
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
@@ -300,6 +328,15 @@ jobs:
             -t ci-demo:${COMMIT_SHA} \
             .
 
+          # Capture Docker image digest (SHA256)
+          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ci-demo:${COMMIT_SHA} 2>/dev/null || echo "")
+          if [ -z "$IMAGE_DIGEST" ]; then
+            # If no RepoDigests (local image), get the image ID instead
+            IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ci-demo:${COMMIT_SHA})
+          fi
+          echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
+          echo "🔐 Image Digest: ${IMAGE_DIGEST}"
+
           # Run new staging container
           echo "▶️  Running new container: ${CONTAINER_NAME}"
           docker run -d \
@@ -307,20 +344,50 @@ jobs:
             -p ${PORT}:8000 \
             ci-demo:${COMMIT_SHA}
 
-          # Verify container is running
-          sleep 2
-          if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "✅ Staging deployment successful"
-            echo "🌐 Container: ${CONTAINER_NAME}"
-            echo "🔌 Port: ${PORT}"
-            echo "📍 Commit: ${COMMIT_SHA}"
-          else
+          # Wait for container startup
+          echo "⏳ Waiting for service to start..."
+          sleep 5
+
+          # Health check: Verify container is running
+          if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
             echo "❌ Container failed to start"
             docker logs ${CONTAINER_NAME}
+            echo "readiness_status=failed" >> $GITHUB_OUTPUT
             exit 1
           fi
 
-      # STEP 7: Verify Staging Image Exists (Production Pre-Check)
+          # Health check: Verify HTTP endpoint is responding
+          echo "🏥 Checking service health..."
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          HEALTH_STATUS="unknown"
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if curl -f -s -o /dev/null http://localhost:${PORT}/ 2>/dev/null; then
+              HEALTH_STATUS="healthy"
+              echo "✅ Service is healthy and responding"
+              break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "⏳ Attempt $RETRY_COUNT/$MAX_RETRIES - waiting for service..."
+            sleep 2
+          done
+
+          if [ "$HEALTH_STATUS" != "healthy" ]; then
+            echo "⚠️  Warning: Service health check did not pass within timeout"
+            echo "   Container is running but may not be fully ready"
+            HEALTH_STATUS="running_unverified"
+          fi
+
+          echo "readiness_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
+
+          echo "✅ Staging deployment successful"
+          echo "🌐 Container: ${CONTAINER_NAME}"
+          echo "🔌 Port: ${PORT}"
+          echo "📍 Commit: ${COMMIT_SHA}"
+          echo "🏥 Health: ${HEALTH_STATUS}"
+
+      # STEP 8: Verify Staging Image Exists (Production Pre-Check)
       # PRODUCTION IMAGE IMMUTABILITY:
       # Production MUST NOT rebuild the Docker image. Here's why:
       #
@@ -364,10 +431,11 @@ jobs:
 
           echo "✅ Staging image verified: ci-demo:${COMMIT_SHA}"
 
-      # STEP 8: Deploy to Production Environment
+      # STEP 9: Deploy to Production Environment
       # DOES NOT rebuild image - uses existing staging image
       # Stops and removes any existing production container
       - name: Deploy to Production
+        id: deploy_production
         if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production' && steps.check_deployed.outputs.already_deployed != 'true'
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
@@ -392,6 +460,15 @@ jobs:
             echo "ℹ️  No existing container found"
           fi
 
+          # Capture Docker image digest (SHA256) from staging image
+          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ci-demo:${COMMIT_SHA} 2>/dev/null || echo "")
+          if [ -z "$IMAGE_DIGEST" ]; then
+            # If no RepoDigests (local image), get the image ID instead
+            IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ci-demo:${COMMIT_SHA})
+          fi
+          echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
+          echo "🔐 Image Digest: ${IMAGE_DIGEST}"
+
           # Run production container using PRE-BUILT staging image
           # DO NOT REBUILD - use existing image only
           echo "▶️  Running new container: ${CONTAINER_NAME}"
@@ -400,20 +477,50 @@ jobs:
             -p ${PORT}:8000 \
             ci-demo:${COMMIT_SHA}
 
-          # Verify container is running
-          sleep 2
-          if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "✅ Production deployment successful"
-            echo "🌐 Container: ${CONTAINER_NAME}"
-            echo "🔌 Port: ${PORT}"
-            echo "📍 Commit: ${COMMIT_SHA}"
-          else
+          # Wait for container startup
+          echo "⏳ Waiting for service to start..."
+          sleep 5
+
+          # Health check: Verify container is running
+          if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
             echo "❌ Container failed to start"
             docker logs ${CONTAINER_NAME}
+            echo "readiness_status=failed" >> $GITHUB_OUTPUT
             exit 1
           fi
 
-      # STEP 9: Post deployment status comment to PR
+          # Health check: Verify HTTP endpoint is responding
+          echo "🏥 Checking service health..."
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          HEALTH_STATUS="unknown"
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if curl -f -s -o /dev/null http://localhost:${PORT}/ 2>/dev/null; then
+              HEALTH_STATUS="healthy"
+              echo "✅ Service is healthy and responding"
+              break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "⏳ Attempt $RETRY_COUNT/$MAX_RETRIES - waiting for service..."
+            sleep 2
+          done
+
+          if [ "$HEALTH_STATUS" != "healthy" ]; then
+            echo "⚠️  Warning: Service health check did not pass within timeout"
+            echo "   Container is running but may not be fully ready"
+            HEALTH_STATUS="running_unverified"
+          fi
+
+          echo "readiness_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
+
+          echo "✅ Production deployment successful"
+          echo "🌐 Container: ${CONTAINER_NAME}"
+          echo "🔌 Port: ${PORT}"
+          echo "📍 Commit: ${COMMIT_SHA}"
+          echo "🏥 Health: ${HEALTH_STATUS}"
+
+      # STEP 10: Post deployment status comment to PR
       # Runs always (success or failure) if validation passed and deployment was attempted
       - name: Post Deployment Status
         if: always() && steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed != 'true'
@@ -424,30 +531,60 @@ jobs:
             const sha = '${{ steps.validate.outputs.pr_sha }}';
             const jobStatus = '${{ job.status }}';
             const prBranch = '${{ steps.validate.outputs.pr_branch }}';
+            const buildTimestamp = '${{ steps.build_metadata.outputs.build_timestamp }}';
+            const deploymentId = '${{ steps.build_metadata.outputs.deployment_id }}';
 
             const statusEmoji = jobStatus === 'success' ? '✅' : '❌';
             const statusText = jobStatus === 'success' ? 'SUCCEEDED' : 'FAILED';
             const port = environment === 'staging' ? '8001' : '8002';
             const containerName = environment === 'staging' ? 'myapp-staging' : 'myapp-prod';
 
+            // Get environment-specific outputs
+            const deployStep = environment === 'staging' ? 'deploy_staging' : 'deploy_production';
+            const imageDigest = environment === 'staging'
+              ? '${{ steps.deploy_staging.outputs.image_digest }}'
+              : '${{ steps.deploy_production.outputs.image_digest }}';
+            const readinessStatus = environment === 'staging'
+              ? '${{ steps.deploy_staging.outputs.readiness_status }}'
+              : '${{ steps.deploy_production.outputs.readiness_status }}';
+
+            // Map readiness status to display text
+            const readinessMap = {
+              'healthy': '✅ Healthy (verified)',
+              'running_unverified': '⚠️ Running (unverified)',
+              'failed': '❌ Failed',
+              '': jobStatus === 'success' ? '✅ Running' : '❌ Failed'
+            };
+            const readinessDisplay = readinessMap[readinessStatus] || readinessStatus;
+
             let comment = `### ${statusEmoji} Deployment ${statusText}
 
-            **Environment:** \`${environment}\`
-            **Status:** ${statusText}
-            **Commit SHA:** \`${sha}\`
-            **Branch:** \`${prBranch}\`
-            **Container:** \`${containerName}\`
-            **Port:** \`${port}\`
+            #### 📋 Deployment Details
+            | Field | Value |
+            |-------|-------|
+            | **Environment** | \`${environment}\` |
+            | **Status** | ${statusText} |
+            | **Commit SHA** | \`${sha}\` |
+            | **Build Timestamp** | \`${buildTimestamp}\` |
+            | **Deployment ID** | \`${deploymentId}\` |
+            | **Container** | \`${containerName}\` |
+            | **Port** | \`${port}\` |
+            ${imageDigest ? `| **Image Digest** | \`${imageDigest.substring(0, 80)}${imageDigest.length > 80 ? '...' : ''}\` |` : ''}
+            | **Service Status** | ${readinessDisplay} |
             `;
 
             if (jobStatus === 'success') {
-              comment += `\n---\n🌐 **Access:** http://localhost:${port}/\n`;
+              comment += `\n---\n#### 🌐 Access Information\n`;
+              comment += `**URL:** http://localhost:${port}/\n`;
+              comment += `**Workflow Run:** [View Logs](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n`;
 
               if (environment === 'staging') {
                 comment += `\n💡 **Next step:** Test staging, then deploy to production with: \`[prod]\``;
               }
             } else {
-              comment += `\n---\n⚠️ **Action Required:** Check workflow logs for details\n`;
+              comment += `\n---\n#### ⚠️ Action Required\n`;
+              comment += `Check workflow logs for detailed error information.\n\n`;
+              comment += `**Workflow Run:** [View Logs](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n`;
             }
 
             await github.rest.issues.createComment({
