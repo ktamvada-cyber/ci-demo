@@ -47,6 +47,8 @@ jobs:
             // STRICT COMMAND MATCHING: Only exact "[staging]" or "[prod]" triggers deployment
             // Prevents typos, variations, or injection attempts from triggering deployments
             if (!validCommands.includes(comment)) {
+              const errorMsg = `Invalid command: "${comment}". Only exact [staging] or [prod] commands are allowed.`;
+              core.setOutput('error_message', errorMsg);
               core.info('Comment does not match deployment triggers: [staging] or [prod]');
               return { shouldDeploy: false };
             }
@@ -55,18 +57,33 @@ jobs:
             const environment = comment === '[staging]' ? 'staging' : 'production';
             core.info(`Deployment requested for: ${environment}`);
 
-            // SECURITY CHECK 1: Verify commenter is repository owner
-            // Only the repository owner can trigger deployments
-            const { data: repo } = await github.rest.repos.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo
-            });
+            // SECURITY CHECK 1: Verify commenter is authorized for the target environment
+            // Different users can deploy to different environments
+            const commenter = context.payload.comment.user.login;
 
-            if (context.payload.comment.user.login !== repo.owner.login) {
-              core.setFailed(`❌ AUTHORIZATION FAILED: Only repository owner (${repo.owner.login}) can trigger deployments. You are: ${context.payload.comment.user.login}`);
+            // Define authorized users per environment
+            const stagingAuthorizedUsers = [
+              'ktamvada-cyber',  // repository owner
+              'gromag'           // additional staging deployer
+            ];
+
+            const productionAuthorizedUsers = [
+              'gromag'           // ONLY gromag can deploy to production (strict)
+            ];
+
+            // Check authorization based on target environment
+            const authorizedUsers = environment === 'staging'
+              ? stagingAuthorizedUsers
+              : productionAuthorizedUsers;
+
+            if (!authorizedUsers.includes(commenter)) {
+              const allowedList = authorizedUsers.join(', ');
+              const errorMsg = `❌ AUTHORIZATION FAILED: User "${commenter}" is not authorized to deploy to ${environment}. Authorized users: ${allowedList}`;
+              core.setOutput('error_message', errorMsg);
+              core.setFailed(errorMsg);
               return { shouldDeploy: false };
             }
-            core.info(`✅ Authorization check passed: ${context.payload.comment.user.login} is owner`);
+            core.info(`✅ Authorization check passed: ${commenter} is authorized for ${environment} deployment`);
 
             // Get PR details
             const { data: pr } = await github.rest.pulls.get({
@@ -78,7 +95,9 @@ jobs:
             // SECURITY CHECK 2: Verify PR is OPEN
             // Prevents deployment of closed or merged PRs
             if (pr.state !== 'open') {
-              core.setFailed(`❌ VALIDATION FAILED: PR #${context.issue.number} is not open (state: ${pr.state})`);
+              const errorMsg = `❌ VALIDATION FAILED: PR #${context.issue.number} is not open (state: ${pr.state})`;
+              core.setOutput('error_message', errorMsg);
+              core.setFailed(errorMsg);
               return { shouldDeploy: false };
             }
             core.info(`✅ PR state check passed: PR is open`);
@@ -87,7 +106,9 @@ jobs:
             // Prevents deployment if PR has conflicts, is blocked, behind, or in unknown state
             // "clean" means: all required checks passed, no conflicts, ready to merge
             if (pr.mergeable_state !== 'clean') {
-              core.setFailed(`❌ VALIDATION FAILED: PR #${context.issue.number} mergeable_state is "${pr.mergeable_state}". Required: "clean". This PR may have conflicts, required checks failing, or be behind the base branch.`);
+              const errorMsg = `❌ VALIDATION FAILED: PR #${context.issue.number} mergeable_state is "${pr.mergeable_state}". Required: "clean". This PR may have conflicts, required checks failing, or be behind the base branch.`;
+              core.setOutput('error_message', errorMsg);
+              core.setFailed(errorMsg);
               return { shouldDeploy: false };
             }
             core.info(`✅ Mergeable state check passed: ${pr.mergeable_state}`);
@@ -95,7 +116,9 @@ jobs:
             // SECURITY CHECK 4: Explicit check for merge conflicts
             // Double verification that no conflicts exist
             if (pr.mergeable === false) {
-              core.setFailed(`❌ VALIDATION FAILED: PR #${context.issue.number} has merge conflicts. Resolve conflicts before deploying.`);
+              const errorMsg = `❌ VALIDATION FAILED: PR #${context.issue.number} has merge conflicts. Resolve conflicts before deploying.`;
+              core.setOutput('error_message', errorMsg);
+              core.setFailed(errorMsg);
               return { shouldDeploy: false };
             }
             core.info(`✅ Merge conflicts check passed: No conflicts detected`);
@@ -134,7 +157,35 @@ jobs:
               prNumber: context.issue.number
             };
 
-      # STEP 2: Checkout exact commit SHA from PR HEAD
+      # STEP 2: Post validation failure message
+      # Runs if validation step completed but deployment was rejected
+      # Provides immediate feedback in PR without checking Actions tab
+      # Displays the EXACT error message from validation
+      - name: Post Validation Failure
+        if: always() && steps.validate.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errorMessage = '${{ steps.validate.outputs.error_message }}';
+
+            const comment = `### ❌ Deployment Rejected
+
+            **Error Details:**
+
+            ${errorMessage || '❌ Validation failed - check workflow logs for details'}
+
+            ---
+            📋 **View Full Logs:** [Workflow Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+      # STEP 3: Checkout exact commit SHA from PR HEAD
       # SECURITY: Always checkout by exact SHA, NEVER by branch name
       # NEVER use git pull - always checkout specific commit
       # This ensures we deploy exactly what was validated, not what's currently on the branch
@@ -145,7 +196,7 @@ jobs:
           ref: ${{ steps.validate.outputs.pr_sha }}
           fetch-depth: 1
 
-      # STEP 3: Deploy to Staging Environment
+      # STEP 4: Deploy to Staging Environment
       # Builds new Docker image tagged with commit SHA
       # Stops and removes any existing staging container
       - name: Deploy to Staging
@@ -200,7 +251,7 @@ jobs:
             exit 1
           fi
 
-      # STEP 4: Verify Staging Image Exists (Production Pre-Check)
+      # STEP 5: Verify Staging Image Exists (Production Pre-Check)
       # PRODUCTION IMAGE IMMUTABILITY:
       # Production MUST NOT rebuild the Docker image. Here's why:
       #
@@ -244,7 +295,7 @@ jobs:
 
           echo "✅ Staging image verified: ci-demo:${COMMIT_SHA}"
 
-      # STEP 5: Deploy to Production Environment
+      # STEP 6: Deploy to Production Environment
       # DOES NOT rebuild image - uses existing staging image
       # Stops and removes any existing production container
       - name: Deploy to Production
@@ -293,7 +344,7 @@ jobs:
             exit 1
           fi
 
-      # STEP 6: Post deployment status comment to PR
+      # STEP 7: Post deployment status comment to PR
       # Runs always (success or failure) if validation passed
       - name: Post Deployment Status
         if: always() && steps.validate.outputs.should_deploy == 'true'
