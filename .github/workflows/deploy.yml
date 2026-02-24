@@ -329,11 +329,12 @@ jobs:
             echo "ℹ️  No existing container found"
           fi
 
-          # Build Docker image with exact commit SHA tag
+          # Build Docker image with exact commit SHA tag and metadata
+          # COMMIT_SHA and BUILD_TIMESTAMP are baked into the image via build args
           echo "🔨 Building Docker image: ci-demo:${COMMIT_SHA}"
           docker build \
             --build-arg COMMIT_SHA=${COMMIT_SHA} \
-            --build-arg ENVIRONMENT=${ENVIRONMENT} \
+            --build-arg BUILD_TIMESTAMP="${{ steps.build_metadata.outputs.build_timestamp }}" \
             -t ci-demo:${COMMIT_SHA} \
             .
 
@@ -346,11 +347,17 @@ jobs:
           echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
           echo "🔐 Image Digest: ${IMAGE_DIGEST}"
 
-          # Run new staging container
+          # Run new staging container with runtime-specific metadata
+          # COMMIT_SHA and BUILD_TIMESTAMP are already in the image, no need to pass again
           echo "▶️  Running new container: ${CONTAINER_NAME}"
           docker run -d \
             --name ${CONTAINER_NAME} \
             -p ${PORT}:8000 \
+            -e ENVIRONMENT=${ENVIRONMENT} \
+            -e DEPLOYMENT_ID="${{ steps.build_metadata.outputs.deployment_id }}" \
+            -e CONTAINER_NAME=${CONTAINER_NAME} \
+            -e PORT=${PORT} \
+            -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
             ci-demo:${COMMIT_SHA}
 
           # Wait for container startup
@@ -480,10 +487,16 @@ jobs:
 
           # Run production container using PRE-BUILT staging image
           # DO NOT REBUILD - use existing image only
+          # COMMIT_SHA and BUILD_TIMESTAMP are already baked into the image from staging build
           echo "▶️  Running new container: ${CONTAINER_NAME}"
           docker run -d \
             --name ${CONTAINER_NAME} \
             -p ${PORT}:8000 \
+            -e ENVIRONMENT=${ENVIRONMENT} \
+            -e DEPLOYMENT_ID="${{ github.run_id }}" \
+            -e CONTAINER_NAME=${CONTAINER_NAME} \
+            -e PORT=${PORT} \
+            -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
             ci-demo:${COMMIT_SHA}
 
           # Wait for container startup
