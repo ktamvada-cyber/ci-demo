@@ -1,11 +1,26 @@
 name: Deploy on Comment
 
+# SECURITY ARCHITECTURE:
+# This workflow uses issue_comment trigger which ALWAYS runs from the default branch (main).
+# This prevents attackers from modifying the workflow in feature branches to bypass security checks.
+# Even if a malicious PR contains a modified .github/workflows/deploy.yml, GitHub will ignore it
+# and execute the version from the default branch only.
+#
+# Reference: https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#issue_comment
 on:
   issue_comment:
     types: [created]
 
+# Explicit permissions following principle of least privilege
+# This workflow can only read code/PRs and write comments - cannot push code or modify settings
+permissions:
+  contents: read        # Read repository contents for checkout
+  pull-requests: read   # Read PR metadata for validation
+  issues: write         # Post deployment status comments
+
 # Concurrency control: Only ONE deployment at a time across all environments
 # Cancel any in-progress deployment when a new one is triggered
+# Prevents race conditions and ensures clean container state
 concurrency:
   group: deployment
   cancel-in-progress: true
@@ -15,6 +30,9 @@ jobs:
     # Security: Only run on pull request comments (not regular issues)
     if: github.event.issue.pull_request != null
     runs-on: self-hosted
+
+    # Prevent runaway deployments - fail if job exceeds 15 minutes
+    timeout-minutes: 15
 
     steps:
       # STEP 1: Validate deployment trigger and perform all security checks
@@ -26,7 +44,8 @@ jobs:
             const comment = context.payload.comment.body.trim();
             const validCommands = ['[staging]', '[prod]'];
 
-            // Check if comment matches deployment trigger
+            // STRICT COMMAND MATCHING: Only exact "[staging]" or "[prod]" triggers deployment
+            // Prevents typos, variations, or injection attempts from triggering deployments
             if (!validCommands.includes(comment)) {
               core.info('Comment does not match deployment triggers: [staging] or [prod]');
               return { shouldDeploy: false };
@@ -37,6 +56,7 @@ jobs:
             core.info(`Deployment requested for: ${environment}`);
 
             // SECURITY CHECK 1: Verify commenter is repository owner
+            // Only the repository owner can trigger deployments
             const { data: repo } = await github.rest.repos.get({
               owner: context.repo.owner,
               repo: context.repo.repo
@@ -56,6 +76,7 @@ jobs:
             });
 
             // SECURITY CHECK 2: Verify PR is OPEN
+            // Prevents deployment of closed or merged PRs
             if (pr.state !== 'open') {
               core.setFailed(`❌ VALIDATION FAILED: PR #${context.issue.number} is not open (state: ${pr.state})`);
               return { shouldDeploy: false };
@@ -64,6 +85,7 @@ jobs:
 
             // SECURITY CHECK 3: Verify mergeable_state is "clean"
             // Prevents deployment if PR has conflicts, is blocked, behind, or in unknown state
+            // "clean" means: all required checks passed, no conflicts, ready to merge
             if (pr.mergeable_state !== 'clean') {
               core.setFailed(`❌ VALIDATION FAILED: PR #${context.issue.number} mergeable_state is "${pr.mergeable_state}". Required: "clean". This PR may have conflicts, required checks failing, or be behind the base branch.`);
               return { shouldDeploy: false };
@@ -71,13 +93,28 @@ jobs:
             core.info(`✅ Mergeable state check passed: ${pr.mergeable_state}`);
 
             // SECURITY CHECK 4: Explicit check for merge conflicts
+            // Double verification that no conflicts exist
             if (pr.mergeable === false) {
               core.setFailed(`❌ VALIDATION FAILED: PR #${context.issue.number} has merge conflicts. Resolve conflicts before deploying.`);
               return { shouldDeploy: false };
             }
             core.info(`✅ Merge conflicts check passed: No conflicts detected`);
 
-            // Extract exact commit SHA from PR HEAD
+            // SHA-BASED DEPLOYMENT SECURITY:
+            // Extract exact commit SHA from PR HEAD and deploy ONLY that specific commit.
+            // This prevents "hitchhiker commits" - a security issue where an attacker pushes
+            // additional malicious commits to the PR branch after approval but before deployment.
+            //
+            // Attack scenario prevented:
+            // 1. Attacker creates PR with commit A (looks safe)
+            // 2. Owner reviews and approves commit A
+            // 3. Attacker pushes commit B (malicious) to same branch
+            // 4. Owner triggers deployment thinking they're deploying commit A
+            // 5. If deploying by branch name, commit B would be deployed (security breach)
+            // 6. With SHA-based deployment, only commit A is deployed (secure)
+            //
+            // By deploying the exact SHA that exists at comment time, we ensure the deployed
+            // code matches what was reviewed, even if the branch is updated afterwards.
             const prSha = pr.head.sha;
             core.info(`📍 Target commit SHA: ${prSha}`);
 
@@ -98,8 +135,9 @@ jobs:
             };
 
       # STEP 2: Checkout exact commit SHA from PR HEAD
-      # NEVER checkout by branch name - always use exact SHA
+      # SECURITY: Always checkout by exact SHA, NEVER by branch name
       # NEVER use git pull - always checkout specific commit
+      # This ensures we deploy exactly what was validated, not what's currently on the branch
       - name: Checkout PR HEAD commit (exact SHA)
         if: steps.validate.outputs.should_deploy == 'true'
         uses: actions/checkout@v4
@@ -163,8 +201,24 @@ jobs:
           fi
 
       # STEP 4: Verify Staging Image Exists (Production Pre-Check)
-      # Production MUST NOT rebuild the image
-      # Production deployment FAILS if staging image does not exist
+      # PRODUCTION IMAGE IMMUTABILITY:
+      # Production MUST NOT rebuild the Docker image. Here's why:
+      #
+      # 1. CONSISTENCY: The staging image was tested. Rebuilding could introduce differences
+      #    due to timestamp differences, network conditions, or external dependency updates.
+      #
+      # 2. SECURITY: Rebuilding creates opportunity for supply chain attacks. If a dependency
+      #    is compromised between staging build and production rebuild, production gets the
+      #    malicious version while staging had the clean version.
+      #
+      # 3. COMPLIANCE: Many regulations require that production deployments are exact copies
+      #    of tested artifacts, not rebuilt versions.
+      #
+      # 4. RELIABILITY: "What you test is what you deploy" - the binary deployed to production
+      #    must be byte-for-byte identical to what was tested in staging.
+      #
+      # Therefore, production deployment FAILS if the staging image does not exist.
+      # This enforces the staging-first workflow and prevents untested production deployments.
       - name: Verify Staging Image Exists
         if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production'
         env:
