@@ -15,7 +15,7 @@ on:
 # This workflow can only read code/PRs and write comments - cannot push code or modify settings
 permissions:
   contents: read        # Read repository contents for checkout
-  pull-requests: read   # Read PR metadata for validation
+  pull-requests: write  # Required to read PR metadata in issue_comment context
   issues: write         # Post deployment status comments
 
 # Concurrency control: Only ONE deployment at a time across all environments
