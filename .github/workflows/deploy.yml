@@ -1,0 +1,284 @@
+name: Deploy on Comment
+
+on:
+  issue_comment:
+    types: [created]
+
+# Concurrency control: Only ONE deployment at a time across all environments
+# Cancel any in-progress deployment when a new one is triggered
+concurrency:
+  group: deployment
+  cancel-in-progress: true
+
+jobs:
+  validate-and-deploy:
+    # Security: Only run on pull request comments (not regular issues)
+    if: github.event.issue.pull_request != null
+    runs-on: self-hosted
+
+    steps:
+      # STEP 1: Validate deployment trigger and perform all security checks
+      - name: Validate deployment trigger and permissions
+        id: validate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment.body.trim();
+            const validCommands = ['[staging]', '[prod]'];
+
+            // Check if comment matches deployment trigger
+            if (!validCommands.includes(comment)) {
+              core.info('Comment does not match deployment triggers: [staging] or [prod]');
+              return { shouldDeploy: false };
+            }
+
+            // Determine target environment
+            const environment = comment === '[staging]' ? 'staging' : 'production';
+            core.info(`Deployment requested for: ${environment}`);
+
+            // SECURITY CHECK 1: Verify commenter is repository owner
+            const { data: repo } = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+
+            if (context.payload.comment.user.login !== repo.owner.login) {
+              core.setFailed(`❌ AUTHORIZATION FAILED: Only repository owner (${repo.owner.login}) can trigger deployments. You are: ${context.payload.comment.user.login}`);
+              return { shouldDeploy: false };
+            }
+            core.info(`✅ Authorization check passed: ${context.payload.comment.user.login} is owner`);
+
+            // Get PR details
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+
+            // SECURITY CHECK 2: Verify PR is OPEN
+            if (pr.state !== 'open') {
+              core.setFailed(`❌ VALIDATION FAILED: PR #${context.issue.number} is not open (state: ${pr.state})`);
+              return { shouldDeploy: false };
+            }
+            core.info(`✅ PR state check passed: PR is open`);
+
+            // SECURITY CHECK 3: Verify mergeable_state is "clean"
+            // Prevents deployment if PR has conflicts, is blocked, behind, or in unknown state
+            if (pr.mergeable_state !== 'clean') {
+              core.setFailed(`❌ VALIDATION FAILED: PR #${context.issue.number} mergeable_state is "${pr.mergeable_state}". Required: "clean". This PR may have conflicts, required checks failing, or be behind the base branch.`);
+              return { shouldDeploy: false };
+            }
+            core.info(`✅ Mergeable state check passed: ${pr.mergeable_state}`);
+
+            // SECURITY CHECK 4: Explicit check for merge conflicts
+            if (pr.mergeable === false) {
+              core.setFailed(`❌ VALIDATION FAILED: PR #${context.issue.number} has merge conflicts. Resolve conflicts before deploying.`);
+              return { shouldDeploy: false };
+            }
+            core.info(`✅ Merge conflicts check passed: No conflicts detected`);
+
+            // Extract exact commit SHA from PR HEAD
+            const prSha = pr.head.sha;
+            core.info(`📍 Target commit SHA: ${prSha}`);
+
+            // Set outputs for subsequent steps
+            core.setOutput('should_deploy', 'true');
+            core.setOutput('environment', environment);
+            core.setOutput('pr_sha', prSha);
+            core.setOutput('pr_number', context.issue.number);
+            core.setOutput('pr_branch', pr.head.ref);
+
+            core.info(`✅ All validation checks passed. Proceeding with ${environment} deployment.`);
+
+            return {
+              shouldDeploy: true,
+              environment: environment,
+              prSha: prSha,
+              prNumber: context.issue.number
+            };
+
+      # STEP 2: Checkout exact commit SHA from PR HEAD
+      # NEVER checkout by branch name - always use exact SHA
+      # NEVER use git pull - always checkout specific commit
+      - name: Checkout PR HEAD commit (exact SHA)
+        if: steps.validate.outputs.should_deploy == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.validate.outputs.pr_sha }}
+          fetch-depth: 1
+
+      # STEP 3: Deploy to Staging Environment
+      # Builds new Docker image tagged with commit SHA
+      # Stops and removes any existing staging container
+      - name: Deploy to Staging
+        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'staging'
+        env:
+          COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
+          ENVIRONMENT: staging
+          CONTAINER_NAME: myapp-staging
+          PORT: 8001
+        run: |
+          echo "🚀 Starting staging deployment..."
+          echo "📍 Commit SHA: ${COMMIT_SHA}"
+          echo "🏷️  Environment: ${ENVIRONMENT}"
+          echo "📦 Container: ${CONTAINER_NAME}"
+          echo "🔌 Port: ${PORT}"
+
+          # Stop and remove existing staging container if running
+          if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "🛑 Stopping existing container: ${CONTAINER_NAME}"
+            docker stop ${CONTAINER_NAME} 2>/dev/null || true
+            echo "🗑️  Removing existing container: ${CONTAINER_NAME}"
+            docker rm ${CONTAINER_NAME} 2>/dev/null || true
+          else
+            echo "ℹ️  No existing container found"
+          fi
+
+          # Build Docker image with exact commit SHA tag
+          echo "🔨 Building Docker image: ci-demo:${COMMIT_SHA}"
+          docker build \
+            --build-arg COMMIT_SHA=${COMMIT_SHA} \
+            --build-arg ENVIRONMENT=${ENVIRONMENT} \
+            -t ci-demo:${COMMIT_SHA} \
+            .
+
+          # Run new staging container
+          echo "▶️  Running new container: ${CONTAINER_NAME}"
+          docker run -d \
+            --name ${CONTAINER_NAME} \
+            -p ${PORT}:8000 \
+            ci-demo:${COMMIT_SHA}
+
+          # Verify container is running
+          sleep 2
+          if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "✅ Staging deployment successful"
+            echo "🌐 Container: ${CONTAINER_NAME}"
+            echo "🔌 Port: ${PORT}"
+            echo "📍 Commit: ${COMMIT_SHA}"
+          else
+            echo "❌ Container failed to start"
+            docker logs ${CONTAINER_NAME}
+            exit 1
+          fi
+
+      # STEP 4: Verify Staging Image Exists (Production Pre-Check)
+      # Production MUST NOT rebuild the image
+      # Production deployment FAILS if staging image does not exist
+      - name: Verify Staging Image Exists
+        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production'
+        env:
+          COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
+        run: |
+          echo "🔍 Checking for staging image: ci-demo:${COMMIT_SHA}"
+
+          # Check if staging image exists
+          if ! docker image inspect ci-demo:${COMMIT_SHA} >/dev/null 2>&1; then
+            echo "❌ DEPLOYMENT FAILED"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "Staging image does not exist: ci-demo:${COMMIT_SHA}"
+            echo ""
+            echo "Production deployments MUST use the staging image."
+            echo "You MUST deploy to staging first:"
+            echo "  1. Comment: [staging]"
+            echo "  2. Wait for staging deployment to complete"
+            echo "  3. Test staging environment"
+            echo "  4. Comment: [prod]"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            exit 1
+          fi
+
+          echo "✅ Staging image verified: ci-demo:${COMMIT_SHA}"
+
+      # STEP 5: Deploy to Production Environment
+      # DOES NOT rebuild image - uses existing staging image
+      # Stops and removes any existing production container
+      - name: Deploy to Production
+        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production'
+        env:
+          COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
+          ENVIRONMENT: production
+          CONTAINER_NAME: myapp-prod
+          PORT: 8002
+        run: |
+          echo "🚀 Starting production deployment..."
+          echo "📍 Commit SHA: ${COMMIT_SHA}"
+          echo "🏷️  Environment: ${ENVIRONMENT}"
+          echo "📦 Container: ${CONTAINER_NAME}"
+          echo "🔌 Port: ${PORT}"
+          echo "⚠️  Using existing staging image (NO REBUILD)"
+
+          # Stop and remove existing production container if running
+          if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "🛑 Stopping existing container: ${CONTAINER_NAME}"
+            docker stop ${CONTAINER_NAME} 2>/dev/null || true
+            echo "🗑️  Removing existing container: ${CONTAINER_NAME}"
+            docker rm ${CONTAINER_NAME} 2>/dev/null || true
+          else
+            echo "ℹ️  No existing container found"
+          fi
+
+          # Run production container using PRE-BUILT staging image
+          # DO NOT REBUILD - use existing image only
+          echo "▶️  Running new container: ${CONTAINER_NAME}"
+          docker run -d \
+            --name ${CONTAINER_NAME} \
+            -p ${PORT}:8000 \
+            ci-demo:${COMMIT_SHA}
+
+          # Verify container is running
+          sleep 2
+          if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "✅ Production deployment successful"
+            echo "🌐 Container: ${CONTAINER_NAME}"
+            echo "🔌 Port: ${PORT}"
+            echo "📍 Commit: ${COMMIT_SHA}"
+          else
+            echo "❌ Container failed to start"
+            docker logs ${CONTAINER_NAME}
+            exit 1
+          fi
+
+      # STEP 6: Post deployment status comment to PR
+      # Runs always (success or failure) if validation passed
+      - name: Post Deployment Status
+        if: always() && steps.validate.outputs.should_deploy == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const environment = '${{ steps.validate.outputs.environment }}';
+            const sha = '${{ steps.validate.outputs.pr_sha }}';
+            const jobStatus = '${{ job.status }}';
+            const prBranch = '${{ steps.validate.outputs.pr_branch }}';
+
+            const statusEmoji = jobStatus === 'success' ? '✅' : '❌';
+            const statusText = jobStatus === 'success' ? 'SUCCEEDED' : 'FAILED';
+            const port = environment === 'staging' ? '8001' : '8002';
+            const containerName = environment === 'staging' ? 'myapp-staging' : 'myapp-prod';
+
+            let comment = `### ${statusEmoji} Deployment ${statusText}
+
+            **Environment:** \`${environment}\`
+            **Status:** ${statusText}
+            **Commit SHA:** \`${sha}\`
+            **Branch:** \`${prBranch}\`
+            **Container:** \`${containerName}\`
+            **Port:** \`${port}\`
+            `;
+
+            if (jobStatus === 'success') {
+              comment += `\n---\n🌐 **Access:** http://localhost:${port}/\n`;
+
+              if (environment === 'staging') {
+                comment += `\n💡 **Next step:** Test staging, then deploy to production with: \`[prod]\``;
+              }
+            } else {
+              comment += `\n---\n⚠️ **Action Required:** Check workflow logs for details\n`;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
