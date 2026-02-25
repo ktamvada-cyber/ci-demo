@@ -23,6 +23,15 @@ curl http://localhost:8002/health
 # Check deployment metadata
 curl http://localhost:8001/deployment-info
 curl http://localhost:8002/deployment-info
+
+# Check GitHub Deployments (shows PR branch/SHA, not main)
+gh api repos/:owner/:repo/deployments \
+  --jq '.[] | select(.environment == "staging") | {environment, ref: .ref[0:7], branch: .payload.pr_branch, status: .statuses_url}' \
+  | head -1
+
+gh api repos/:owner/:repo/deployments \
+  --jq '.[] | select(.environment == "production") | {environment, ref: .ref[0:7], branch: .payload.pr_branch, status: .statuses_url}' \
+  | head -1
 ```
 
 ### View Application Logs
@@ -561,6 +570,15 @@ wait
 ### Deployment History
 
 ```bash
+# From GitHub Deployments UI (recommended)
+# Navigate to: Repository → Environments → staging or production
+# Shows: Branch, commit SHA, status, timestamps for all deployments
+
+# From GitHub API (programmatic access)
+gh api repos/:owner/:repo/deployments --jq '.[] | select(.environment == "staging") | {sha: .sha, created: .created_at, url: .payload.pr_branch}'
+
+gh api repos/:owner/:repo/deployments --jq '.[] | select(.environment == "production") | {sha: .sha, created: .created_at, url: .payload.pr_branch}'
+
 # From workflow runs
 gh run list --workflow="Deploy on Comment" --limit 20
 

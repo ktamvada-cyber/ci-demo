@@ -71,6 +71,14 @@ A GitHub Actions workflow that deploys code to local Docker containers when auth
                      │
                      ▼ PASS
 ┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1.5: Create GitHub Deployment (via API)                       │
+│  • Create deployment record with ref = PR head SHA                  │
+│  • Set initial status to "in_progress"                              │
+│  • Provides correct branch/SHA visibility in GitHub UI              │
+└────────────────────┬────────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 2: Checkout exact SHA (not branch)                            │
 │  • git checkout <PR_HEAD_SHA>                                       │
 │  • Never use branch name; prevents hitchhiker attacks               │
@@ -137,15 +145,17 @@ A GitHub Actions workflow that deploys code to local Docker containers when auth
 **What this workflow CONTAINS:**
 
 1. **Validation** (lines 47-167): Authorization, PR state, mergeable_state, conflict detection, SHA extraction
-2. **Checkout** (lines 201-206): Checkout exact SHA from PR HEAD
-3. **Metadata capture** (lines 210-224): Timestamp, deployment ID, commit SHA
-4. **Duplicate detection** (lines 229-258): Check if same SHA already running
-5. **Already-deployed notification** (lines 262-302): Post skip message if duplicate
-6. **Staging deployment** (lines 307-404): Build image, run container, health check
-7. **Production pre-check** (lines 425-448): Verify staging image exists (enforce staging-first)
-8. **Production deployment** (lines 453-543): Reuse staging image, run container, health check
-9. **Status reporting** (lines 547-617): Post success/failure comment with details
-10. **Validation failure reporting** (lines 173-195): Post rejection message on failed validation
+2. **GitHub Deployment creation** (lines 170-218): Create deployment record via API tied to PR head SHA (not main)
+3. **Validation failure reporting** (lines 220-246): Post rejection message on failed validation
+4. **Checkout** (lines 248-253): Checkout exact SHA from PR HEAD
+5. **Metadata capture** (lines 257-271): Timestamp, deployment ID, commit SHA
+6. **Duplicate detection** (lines 276-305): Check if same SHA already running
+7. **Already-deployed notification** (lines 309-349): Post skip message if duplicate
+8. **Staging deployment** (lines 354-451): Build image, run container, health check
+9. **Production pre-check** (lines 472-495): Verify staging image exists (enforce staging-first)
+10. **Production deployment** (lines 500-590): Reuse staging image, run container, health check
+11. **Status reporting** (lines 594-664): Post success/failure comment with details
+12. **Deployment status update** (lines 670-716): Update GitHub Deployment record with final status
 
 **What this workflow does NOT contain:**
 
@@ -160,6 +170,14 @@ A GitHub Actions workflow that deploys code to local Docker containers when auth
 - Deployment lock acquisition (beyond GitHub concurrency group)
 - Blue-green or canary deployment strategy
 - Automated rollback on failed health checks
+
+**Deployment Visibility:**
+
+This workflow creates GitHub Deployment records via API to track deployments correctly:
+- Deployments are tied to the PR head SHA (not main branch)
+- Visible in GitHub UI: Repository → Environments → staging/production
+- Each deployment shows: commit SHA, status, environment URL, workflow logs (PR branch info in description/payload)
+- Note: Two deployment records are created (one from job-level `environment:` for approval gates, one from API for correct ref tracking)
 
 ---
 
@@ -217,8 +235,9 @@ Workflow requires:
 - `contents: read` - Checkout code
 - `pull-requests: write` - Read PR metadata via API (issue_comment context limitation)
 - `issues: write` - Post deployment status comments
+- `deployments: write` - Create GitHub Deployment records via API for correct ref tracking
 
-These are declared in workflow lines 16-19.
+These are declared in workflow lines 16-20.
 
 ### 5. Authorized Users
 
@@ -548,9 +567,11 @@ Check workflow logs for detailed error information.
 **Key log sections:**
 
 1. **Validate deployment trigger and permissions:** Shows all validation checks, extracted SHA, authorization result
-2. **Checkout PR HEAD commit:** Confirms exact SHA checked out
-3. **Deploy to Staging/Production:** Docker build output, container start, health check attempts
-4. **Post Deployment Status:** Comment posting confirmation
+2. **Create GitHub Deployment:** Deployment record creation confirmation
+3. **Checkout PR HEAD commit:** Confirms exact SHA checked out
+4. **Deploy to Staging/Production:** Docker build output, container start, health check attempts
+5. **Post Deployment Status:** Comment posting confirmation
+6. **Update Deployment Status:** Final deployment status update
 
 **Debugging failed deployments:**
 
@@ -561,6 +582,24 @@ docker logs myapp-staging  # View application logs
 docker inspect myapp-staging  # Check configuration
 docker images | grep ci-demo  # List built images
 ```
+
+### GitHub Deployments UI
+
+**Access:** Repository → Environments → staging or production
+
+**What you'll see:**
+- All deployments for each environment
+- Each deployment shows:
+  - **Ref:** PR head SHA (branch info available in deployment description/payload)
+  - **Commit SHA:** Exact PR head commit
+  - **Status:** In progress, Success, or Failure
+  - **Environment URL:** http://localhost:8001 (staging) or http://localhost:8002 (production)
+  - **Workflow logs:** Link to Actions run
+- Deployment timeline and history
+
+**Note:** Each deployment creates two records:
+1. **Job-level environment (for approval):** Shows main branch, handles GitHub Environment protection
+2. **API-created (for tracking):** Shows PR branch/SHA, provides accurate deployment visibility
 
 ---
 

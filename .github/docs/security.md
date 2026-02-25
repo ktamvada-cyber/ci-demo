@@ -251,13 +251,14 @@ git push
 
 **Mitigation:**
 
-Explicit permissions declaration (lines 16-19):
+Explicit permissions declaration (lines 16-20):
 
 ```yaml
 permissions:
   contents: read        # Can only read code; cannot push
   pull-requests: write  # Can read PR metadata; cannot merge
   issues: write         # Can post comments; cannot close/transfer
+  deployments: write    # Can create deployment records; cannot modify environments
 ```
 
 **What workflow CANNOT do:**
@@ -268,12 +269,15 @@ permissions:
 - Access secrets not explicitly declared in workflow
 - Create releases
 - Modify GitHub Actions settings
+- Modify environment protection rules
 
 **What workflow CAN do:**
 - Read repository files (for checkout)
 - Read PR metadata (number, SHA, state, mergeable_state)
 - Post comments on PRs
 - Post comments on issues
+- Create deployment records (for tracking visibility)
+- Update deployment statuses
 
 **Why `pull-requests: write` instead of `read`:**
 
@@ -282,6 +286,15 @@ GitHub API quirk: `issue_comment` events provide issue context, not PR context. 
 await github.rest.pulls.get({ owner, repo, pull_number })
 ```
 This endpoint requires `pull-requests: write` permission (despite being a read operation).
+
+**Why `deployments: write`:**
+
+Added to create GitHub Deployment records via API that are tied to the PR head SHA (not main branch). This provides correct deployment visibility in the GitHub Environments UI without affecting the security model. The workflow:
+- Creates a deployment record after validation (step 1.5)
+- Updates the deployment status at the end (step 11)
+- Does NOT modify environment protection rules or bypass approval gates
+
+The workflow cannot modify repository settings or environment protection rules because it lacks `administration: write` permission.
 
 **Verification:**
 ```bash

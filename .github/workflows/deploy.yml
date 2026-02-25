@@ -17,6 +17,7 @@ permissions:
   contents: read        # Read repository contents for checkout
   pull-requests: write  # Required to read PR metadata in issue_comment context
   issues: write         # Post deployment status comments
+  deployments: write    # Create GitHub Deployments via API for correct ref tracking
 
 # Concurrency control: Only ONE deployment at a time across all environments
 # Cancel any in-progress deployment when a new one is triggered
@@ -165,6 +166,56 @@ jobs:
               prSha: prSha,
               prNumber: context.issue.number
             };
+
+      # STEP 1.5: Create GitHub Deployment via API
+      # Creates a deployment record tied to the PR head SHA (not main)
+      # This gives correct visibility in GitHub Deployments/Environments UI
+      # The job-level environment: setting handles approval gates
+      - name: Create GitHub Deployment
+        id: create_deployment
+        if: steps.validate.outputs.should_deploy == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const environment = '${{ steps.validate.outputs.environment }}';
+            const prSha = '${{ steps.validate.outputs.pr_sha }}';
+            const prBranch = '${{ steps.validate.outputs.pr_branch }}';
+            const prNumber = '${{ steps.validate.outputs.pr_number }}';
+
+            core.info(`📝 Creating deployment record for ${environment}`);
+            core.info(`   Ref (SHA): ${prSha}`);
+            core.info(`   Branch: ${prBranch}`);
+            core.info(`   PR: #${prNumber}`);
+
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: prSha,
+              environment,
+              auto_merge: false,
+              description: `Deploy PR #${prNumber} (${prBranch}) to ${environment} via comment trigger`,
+              payload: {
+                pr_number: prNumber,
+                pr_branch: prBranch,
+                pr_sha: prSha,
+                triggered_by: context.payload.comment.user.login,
+                comment_id: context.payload.comment.id
+              }
+            });
+
+            core.setOutput('deployment_id', deployment.id);
+            core.info(`✅ Deployment created: ID ${deployment.id}`);
+
+            // Mark as in-progress for better visibility
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.id,
+              state: 'in_progress',
+              environment,
+              description: `🚀 Deployment started for ${environment}`,
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
 
       # STEP 2: Post validation failure message
       # Runs if validation step completed but deployment was rejected
@@ -615,3 +666,52 @@ jobs:
               issue_number: context.issue.number,
               body: comment
             });
+
+      # STEP 11: Update GitHub Deployment Status
+      # Updates the deployment record created in step 1.5 with final status
+      # Runs always (success/failure/cancelled) if deployment was created
+      - name: Update Deployment Status
+        if: always() && steps.create_deployment.outputs.deployment_id
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deploymentId = Number('${{ steps.create_deployment.outputs.deployment_id }}');
+            const environment = '${{ steps.validate.outputs.environment }}';
+            const jobStatus = '${{ job.status }}';
+            const alreadyDeployed = '${{ steps.check_deployed.outputs.already_deployed }}' === 'true';
+            const prSha = '${{ steps.validate.outputs.pr_sha }}';
+
+            let state;
+            let description;
+
+            if (alreadyDeployed) {
+              state = 'success';
+              description = `✅ Skipped - SHA ${prSha.substring(0, 7)} already running in ${environment}`;
+            } else if (jobStatus === 'success') {
+              state = 'success';
+              description = `✅ Deployed SHA ${prSha.substring(0, 7)} to ${environment}`;
+            } else if (jobStatus === 'failure') {
+              state = 'failure';
+              description = `❌ Deployment to ${environment} failed`;
+            } else {
+              state = 'error';
+              description = `⚠️ Deployment to ${environment} ended with status: ${jobStatus}`;
+            }
+
+            const port = environment === 'staging' ? '8001' : '8002';
+            const environmentUrl = `http://localhost:${port}/`;
+            const logUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deploymentId,
+              state,
+              environment,
+              description,
+              environment_url: environmentUrl,
+              log_url: logUrl,
+              auto_inactive: true
+            });
+
+            core.info(`✅ Deployment status updated: ${state}`);
