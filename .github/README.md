@@ -118,19 +118,21 @@ A GitHub Actions workflow that deploys code to local Docker containers when auth
 │    -t ci-demo:<SHA>      │                  │
 │  • docker run -d         │                  ▼ APPROVED
 │    -p 8001:8000          │      ┌──────────────────────────────────┐
-│    --name myapp-staging  │      │ STEP 5b: Verify Staging Image   │
-│  • Health check:         │      │  • docker image inspect          │
-│    curl localhost:8001/  │      │    ci-demo:<SHA>                 │
-│  • Post success comment  │      │  • FAIL if image doesn't exist   │
-└──────────────────────────┘      │    (forces staging-first flow)   │
-                                  └───────────┬──────────────────────┘
-                                              │
+│    -e API_KEY=$KEY       │      │ STEP 5b: Verify Staging Image   │
+│    -e DB_HOST=$HOST      │      │  • docker image inspect          │
+│    --name myapp-staging  │      │    ci-demo:<SHA>                 │
+│  • Health check:         │      │  • FAIL if image doesn't exist   │
+│    curl localhost:8001/  │      │    (forces staging-first flow)   │
+│  • Post success comment  │      └───────────┬──────────────────────┘
+└──────────────────────────┘                  │
                                               ▼
                                   ┌──────────────────────────────────┐
                                   │ STEP 5c: Deploy Production       │
                                   │  • docker stop/rm old            │
                                   │  • docker run -d                 │
                                   │    -p 8002:8000                  │
+                                  │    -e API_KEY=$KEY               │
+                                  │    -e DB_HOST=$HOST              │
                                   │    --name myapp-prod             │
                                   │    ci-demo:<SHA>  ← REUSE image  │
                                   │  • NO REBUILD                    │
@@ -151,9 +153,9 @@ A GitHub Actions workflow that deploys code to local Docker containers when auth
 5. **Metadata capture** (lines 257-271): Timestamp, deployment ID, commit SHA
 6. **Duplicate detection** (lines 276-305): Check if same SHA already running
 7. **Already-deployed notification** (lines 309-349): Post skip message if duplicate
-8. **Staging deployment** (lines 354-451): Build image, run container, health check
-9. **Production pre-check** (lines 472-495): Verify staging image exists (enforce staging-first)
-10. **Production deployment** (lines 500-590): Reuse staging image, run container, health check
+8. **Staging deployment** (lines 355-455): Build image with non-secret metadata, inject secrets at runtime, run container, health check
+9. **Production pre-check** (lines 476-499): Verify staging image exists (enforce staging-first)
+10. **Production deployment** (lines 501-594): Reuse staging image, inject production secrets at runtime, run container, health check
 11. **Status reporting** (lines 594-664): Post success/failure comment with details
 12. **Deployment status update** (lines 670-716): Update GitHub Deployment record with final status
 
@@ -164,7 +166,7 @@ A GitHub Actions workflow that deploys code to local Docker containers when auth
 - Health check SHA verification (checks `GET /` responds, doesn't verify returned SHA)
 - Rollback trigger independent of PRs
 - Deployment queueing (uses cancel-in-progress which can abort mid-operation)
-- Secrets injection from vault/SSM
+- Secrets injection from external vaults (HashiCorp Vault, AWS SSM, etc.) - uses GitHub Environment secrets
 - Post-deployment smoke tests beyond HTTP 200 check
 - Notification to Slack/email/PagerDuty
 - Deployment lock acquisition (beyond GitHub concurrency group)
@@ -212,24 +214,45 @@ lsof -i :8001
 lsof -i :8002
 ```
 
-### 3. GitHub Environment Protection (for production)
+### 3. GitHub Environment Secrets
 
-**Setup production environment:**
+**Required** for injecting runtime secrets (API_KEY, DB_HOST) into containers.
+
+**Setup staging environment secrets:**
 
 1. Go to repository Settings → Environments
-2. Click "New environment"
-3. Name: `production`
-4. Enable "Required reviewers"
-5. Add at least 1 reviewer (e.g., ktamvada-cyber)
-6. (Optional) Enable "Prevent self-review"
-7. Save
+2. Create or select environment: `staging`
+3. Click "Add secret"
+4. Add secret: `API_KEY` with staging value
+5. Add secret: `DB_HOST` with staging database host
+6. Save
 
-**Setup staging environment (optional, for deployment history tracking):**
+**Setup production environment secrets:**
 
-1. Create environment: `staging`
-2. Do NOT add protection rules (staging should auto-deploy)
+1. Create or select environment: `production`
+2. Add secret: `API_KEY` with production value
+3. Add secret: `DB_HOST` with production database host
+4. Save
 
-### 4. GitHub Permissions
+**Security notes:**
+- Secrets are injected at container runtime via `-e API_KEY="${API_KEY}"`
+- Secrets are NOT passed as build args (would leak into image history)
+- Per-environment values automatically resolve based on deployment target
+- For build-time secrets (e.g., private npm tokens), use Docker BuildKit `--secret` mounts
+
+### 4. GitHub Environment Protection (for production)
+
+**Setup production environment protection:**
+
+1. In the `production` environment (created above)
+2. Enable "Required reviewers"
+3. Add at least 1 reviewer (e.g., ktamvada-cyber)
+4. (Optional) Enable "Prevent self-review"
+5. Save
+
+**Note:** Staging environment should NOT have protection rules (auto-deploys after validation)
+
+### 5. GitHub Permissions
 
 Workflow requires:
 - `contents: read` - Checkout code
@@ -239,7 +262,7 @@ Workflow requires:
 
 These are declared in workflow lines 16-20.
 
-### 5. Authorized Users
+### 6. Authorized Users
 
 Edit lines 73-81 in workflow YAML to set allowed deployers:
 
@@ -258,6 +281,8 @@ const productionAuthorizedUsers = [
 ---
 
 ## How to Use
+
+**Prerequisites:** Ensure GitHub Environment secrets are configured (see Prerequisites section above).
 
 ### Staging Deployment
 

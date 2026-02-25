@@ -70,6 +70,8 @@ docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' myapp-stagin
 # CONTAINER_NAME=myapp-staging
 # PORT=8001
 # IMAGE_DIGEST=sha256:def456...
+# API_KEY=staging-key-value
+# DB_HOST=staging-db.example.com
 ```
 
 ### List Docker Images
@@ -172,6 +174,8 @@ docker run -d \
   -e CONTAINER_NAME=myapp-prod \
   -e PORT=8002 \
   -e IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ci-demo:${ROLLBACK_SHA}) \
+  -e API_KEY="your-production-api-key" \
+  -e DB_HOST="your-production-db-host" \
   ci-demo:${ROLLBACK_SHA}
 
 # Step 4: Verify rollback

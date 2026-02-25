@@ -10,7 +10,7 @@
 - **Staging environment** (localhost:8001, myapp-staging container)
 - **Docker images** (ci-demo:<SHA> tagged images)
 - **Source code** (repository contents)
-- **Secrets** (environment variables, if any)
+- **Secrets** (API_KEY, DB_HOST injected via GitHub Environment secrets)
 
 ### Threat Actors
 
@@ -367,7 +367,76 @@ docker rmi ci-demo:abc123...
 
 ---
 
-### 7. Environment Protection (Manual Approval for Production)
+### 7. Secrets Management (Runtime Injection, Never Build Args)
+
+**Threat:** Secrets leaked via Docker image layers, history, or logs.
+
+**Attack vector:**
+```dockerfile
+# INSECURE: Secrets passed as build args
+ARG API_KEY
+ENV API_KEY=$API_KEY
+```
+→ Secrets visible in `docker history`, image metadata, and potentially logs
+
+**Mitigation:**
+
+Secrets are injected at runtime via GitHub Environment secrets (lines 367-368, 513-514):
+
+```yaml
+env:
+  API_KEY: ${{ secrets.API_KEY }}
+  DB_HOST: ${{ secrets.DB_HOST }}
+run: |
+  docker run -d \
+    -e API_KEY="${API_KEY}" \
+    -e DB_HOST="${DB_HOST}" \
+    ci-demo:${COMMIT_SHA}
+```
+
+**Why this is secure:**
+- **No build arg leakage:** Build args are visible in `docker history` and image metadata; runtime env vars are not
+- **Per-environment values:** GitHub Environment secrets automatically resolve to staging or production values based on the `environment:` setting
+- **No logs:** Secrets are passed directly to docker run without being printed to workflow logs
+- **Not baked into image:** Secrets are only in the running container's memory, never in the image layers
+
+**For build-time secrets** (e.g., private npm registry):
+```yaml
+# Use Docker BuildKit secret mounts
+DOCKER_BUILDKIT=1 docker build \
+  --secret id=npm_token,env=NPM_TOKEN \
+  -t ci-demo:${COMMIT_SHA} .
+```
+```dockerfile
+# In Dockerfile
+RUN --mount=type=secret,id=npm_token \
+    NPM_TOKEN=$(cat /run/secrets/npm_token) npm install
+```
+→ Secret is available during build but never written to image layers
+
+**Configuration required:**
+1. GitHub → Settings → Environments → **staging**
+   - Add secret: `API_KEY` (staging value)
+   - Add secret: `DB_HOST` (staging value)
+
+2. GitHub → Settings → Environments → **production**
+   - Add secret: `API_KEY` (production value)
+   - Add secret: `DB_HOST` (production value)
+
+**Verification:**
+```bash
+# Check image history (secrets should NOT appear)
+docker history ci-demo:abc123... | grep -i "api_key\|db_host"
+# Should return nothing
+
+# Check running container (secrets SHOULD be present)
+docker exec myapp-staging env | grep "API_KEY\|DB_HOST"
+# Should show: API_KEY=... DB_HOST=...
+```
+
+---
+
+### 8. Environment Protection (Manual Approval for Production)
 
 **Threat:** Accidental or unauthorized production deployment.
 
@@ -426,7 +495,8 @@ environment:
 - [ ] GitHub Environment "production" is configured with required reviewers
 - [ ] Authorized user lists (lines 73-81) contain only trusted users
 - [ ] Repository has branch protection on main (prevents direct pushes, requires PR reviews)
-- [ ] Dockerfile does not include secrets (use GitHub Secrets or runtime env vars)
+- [ ] Dockerfile does not include secrets (secrets are injected at runtime via GitHub Environment secrets)
+- [ ] GitHub Environment secrets (API_KEY, DB_HOST) are configured for staging and production environments
 - [ ] Application does not log sensitive data (commit SHA, deployment ID are safe to log)
 
 **During deployment:**
@@ -450,7 +520,7 @@ environment:
 
 1. **SHA verification in health check:** Workflow checks if `GET /` responds (HTTP 200) but does not verify returned commit SHA matches deployed SHA. Application could serve wrong version or lie about deployed SHA.
 
-2. **No secrets management:** Workflow does not inject secrets from vault, AWS SSM, etc. Secrets must be hardcoded in Dockerfile or passed as GitHub Secrets.
+2. **GitHub Environments for secrets:** Secrets (API_KEY, DB_HOST) are injected at runtime from GitHub Environment secrets. Per-environment values are supported (staging vs production). Build args are only used for non-sensitive metadata (COMMIT_SHA, BUILD_TIMESTAMP). For build-time secrets (e.g., private package registry tokens), use Docker BuildKit secret mounts to prevent leakage into image layers.
 
 3. **Single-runner deployment:** Images stored locally on runner. If runner changes, images are lost. No registry push/pull for multi-runner support.
 
