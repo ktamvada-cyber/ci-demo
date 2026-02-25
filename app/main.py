@@ -20,6 +20,7 @@ def deployment_info():
     This endpoint shows what version is currently deployed and running.
     """
     # Mask API_KEY for security (show only first 8 chars)
+    #new commit thats it
     api_key = os.getenv("API_KEY", "not-set")
     api_key_masked = api_key[:8] + "***" if len(api_key) > 8 else api_key
 
