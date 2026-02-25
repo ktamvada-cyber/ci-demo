@@ -204,7 +204,7 @@ jobs:
             });
 
             core.setOutput('deployment_id', deployment.id);
-            core.info(`✅ Deployment created: ID ${deployment.id}`);
+            core.info(`Deployment created: ID ${deployment.id}`);
 
             // Mark as in-progress for better visibility
             await github.rest.repos.createDeploymentStatus({
@@ -213,7 +213,7 @@ jobs:
               deployment_id: deployment.id,
               state: 'in_progress',
               environment,
-              description: `🚀 Deployment started for ${environment}`,
+              description: `Deployment started for ${environment}`,
               log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             });
 
@@ -681,22 +681,30 @@ jobs:
             const alreadyDeployed = '${{ steps.check_deployed.outputs.already_deployed }}' === 'true';
             const prSha = '${{ steps.validate.outputs.pr_sha }}';
 
+            // Sanitizer to remove 4-byte Unicode characters (emoji) that GitHub API rejects
+            const sanitize = (s) => Array.from(s)
+              .filter(ch => ch.codePointAt(0) <= 0xFFFF)
+              .join('');
+
             let state;
             let description;
 
             if (alreadyDeployed) {
               state = 'success';
-              description = `✅ Skipped - SHA ${prSha.substring(0, 7)} already running in ${environment}`;
+              description = `Skipped - SHA ${prSha.substring(0, 7)} already running in ${environment}`;
             } else if (jobStatus === 'success') {
               state = 'success';
-              description = `✅ Deployed SHA ${prSha.substring(0, 7)} to ${environment}`;
+              description = `Deployed SHA ${prSha.substring(0, 7)} to ${environment}`;
             } else if (jobStatus === 'failure') {
               state = 'failure';
-              description = `❌ Deployment to ${environment} failed`;
+              description = `Deployment to ${environment} failed`;
             } else {
               state = 'error';
-              description = `⚠️ Deployment to ${environment} ended with status: ${jobStatus}`;
+              description = `Deployment to ${environment} ended with status: ${jobStatus}`;
             }
+
+            // Sanitize description to prevent 422 errors from emoji/4-byte chars
+            description = sanitize(description);
 
             const port = environment === 'staging' ? '8001' : '8002';
             const environmentUrl = `http://localhost:${port}/`;
@@ -714,4 +722,4 @@ jobs:
               auto_inactive: true
             });
 
-            core.info(`✅ Deployment status updated: ${state}`);
+            core.info(`Deployment status updated: ${state}`);
