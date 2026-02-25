@@ -41,3 +41,18 @@ def health_check():
         "environment": os.getenv("ENVIRONMENT", "unknown"),
         "commit": os.getenv("COMMIT_SHA", "unknown")
     }
+
+@app.get("/api/version")
+def version_info():
+    """
+    Returns version information and deployment metadata.
+    Useful for verifying which version is deployed via GitHub Deployments.
+    """
+    return {
+        "version": "2.1.0",
+        "commit_sha": os.getenv("COMMIT_SHA", "unknown"),
+        "environment": os.getenv("ENVIRONMENT", "unknown"),
+        "deployment_id": os.getenv("DEPLOYMENT_ID", "unknown"),
+        "build_timestamp": os.getenv("BUILD_TIMESTAMP", "unknown"),
+        "feature": "GitHub Deployments API Integration Test"
+    }
