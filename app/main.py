@@ -19,6 +19,10 @@ def deployment_info():
     Returns comprehensive deployment information about the running instance.
     This endpoint shows what version is currently deployed and running.
     """
+    # Mask API_KEY for security (show only first 8 chars)
+    api_key = os.getenv("API_KEY", "not-set")
+    api_key_masked = api_key[:8] + "***" if len(api_key) > 8 else api_key
+
     return {
         "environment": os.getenv("ENVIRONMENT", "unknown"),
         "commit_sha": os.getenv("COMMIT_SHA", "unknown"),
@@ -27,6 +31,8 @@ def deployment_info():
         "container_name": os.getenv("CONTAINER_NAME", "unknown"),
         "port": os.getenv("PORT", "8000"),
         "image_digest": os.getenv("IMAGE_DIGEST", "unknown"),
+        "api_key": api_key_masked,
+        "db_host": os.getenv("DB_HOST", "not-set"),
         "status": "running",
         "server_time": datetime.utcnow().isoformat() + "Z"
     }
