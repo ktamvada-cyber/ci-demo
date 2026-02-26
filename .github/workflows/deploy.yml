@@ -191,6 +191,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               ref: prSha,
+              task: `${prBranch}:deploy`,  // Shows branch + action in UI (e.g., "feature_1:deploy")
               environment,
               auto_merge: false,
               description: `Deploy PR #${prNumber} (${prBranch}) to ${environment} via comment trigger`,
