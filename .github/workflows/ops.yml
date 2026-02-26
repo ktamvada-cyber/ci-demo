@@ -275,9 +275,9 @@ jobs:
               core.info(`✅ Rollback target validated`);
             }
 
-            // Determine container and port
-            const containerName = environment === 'staging' ? 'myapp-staging' : 'myapp-prod';
-            const port = environment === 'staging' ? '8001' : '8002';
+            // Determine container and port from workflow env constants
+            const containerName = environment === 'staging' ? process.env.STAGING_CONTAINER : process.env.PROD_CONTAINER;
+            const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
 
             // Set outputs
             core.setOutput('should_run', 'true');
@@ -351,8 +351,8 @@ jobs:
             CURRENT_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME} 2>/dev/null || echo "")
             echo "📦 Current image: ${CURRENT_IMAGE}"
 
-            # Extract SHA from image tag (ci-demo:<sha>)
-            if [[ "$CURRENT_IMAGE" =~ ci-demo:([a-f0-9]{40}) ]]; then
+            # Extract SHA from image tag (${IMAGE_NAME}:<sha>)
+            if [[ "$CURRENT_IMAGE" =~ ${IMAGE_NAME}:([a-f0-9]{40}) ]]; then
               CURRENT_SHA="${BASH_REMATCH[1]}"
               echo "📍 Current SHA: ${CURRENT_SHA}"
             else
@@ -556,7 +556,7 @@ jobs:
             # For redeploy, use provided SHA or current SHA/image
             if [ -n "$TARGET_SHA" ]; then
               FINAL_SHA="$TARGET_SHA"
-              FINAL_IMAGE_REF="ci-demo:${FINAL_SHA}"
+              FINAL_IMAGE_REF="${IMAGE_NAME}:${FINAL_SHA}"
               echo "🎯 Redeploy with provided SHA: ${FINAL_SHA}"
             else
               # Use current container's image (allow redeploy from inferred image)
@@ -681,7 +681,7 @@ jobs:
               fi
             fi
 
-            FINAL_IMAGE_REF="ci-demo:${FINAL_SHA}"
+            FINAL_IMAGE_REF="${IMAGE_NAME}:${FINAL_SHA}"
           fi
 
           # Validate final SHA or image
@@ -880,7 +880,7 @@ jobs:
             if [ -n "$FINAL_IMAGE_REF" ]; then
               TARGET_IMAGE="$FINAL_IMAGE_REF"
             elif [ -n "$FINAL_SHA" ]; then
-              TARGET_IMAGE="ci-demo:${FINAL_SHA}"
+              TARGET_IMAGE="${IMAGE_NAME}:${FINAL_SHA}"
             else
               echo "❌ ERROR: Cannot redeploy without target image or SHA"
               exit 1
@@ -946,7 +946,7 @@ jobs:
               exit 1
             fi
 
-            TARGET_IMAGE="ci-demo:${FINAL_SHA}"
+            TARGET_IMAGE="${IMAGE_NAME}:${FINAL_SHA}"
             echo "🎯 Rollback target: ${TARGET_IMAGE}"
 
             # Verify image exists locally
@@ -1014,7 +1014,7 @@ jobs:
           fi
 
           # Verify HTTP endpoint is responding (same retry logic as deploy.yml)
-          MAX_RETRIES=10
+          MAX_RETRIES=${HEALTH_CHECK_MAX_RETRIES}
           RETRY_COUNT=0
 
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
@@ -1025,7 +1025,7 @@ jobs:
             fi
             RETRY_COUNT=$((RETRY_COUNT + 1))
             echo "⏳ Attempt $RETRY_COUNT/$MAX_RETRIES - waiting for service..."
-            sleep 2
+            sleep ${HEALTH_CHECK_RETRY_SLEEP}
           done
 
           if [ "$HEALTH_STATUS" != "healthy" ]; then
@@ -1047,7 +1047,7 @@ jobs:
           # Record all ops actions to history (restart, redeploy, rollback)
           if [ -n "$FINAL_SHA" ]; then
             echo "📝 Recording to local history: ${HISTORY_FILE}"
-            echo "${TIMESTAMP} action=${ACTION} sha=${FINAL_SHA} image=${ACTUAL_IMAGE:-ci-demo:${FINAL_SHA}} digest=${IMAGE_DIGEST} run_id=${{ github.run_id }}" >> ${HISTORY_FILE}
+            echo "${TIMESTAMP} action=${ACTION} sha=${FINAL_SHA} image=${ACTUAL_IMAGE:-${IMAGE_NAME}:${FINAL_SHA}} digest=${IMAGE_DIGEST} run_id=${{ github.run_id }}" >> ${HISTORY_FILE}
           elif [ "$ACTION" = "restart" ] && [ -n "$ACTUAL_IMAGE" ]; then
             # Record restart with image info (helpful for tracking)
             echo "📝 Recording restart to local history: ${HISTORY_FILE}"
@@ -1193,7 +1193,7 @@ jobs:
             // Sanitize description
             description = sanitize(description);
 
-            const port = environment === 'staging' ? '8001' : '8002';
+            const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
             const environmentUrl = `http://localhost:${port}/`;
             const logUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
