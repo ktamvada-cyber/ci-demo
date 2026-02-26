@@ -268,3 +268,193 @@ def sanitize_deployment_info(info: Dict[str, Any], mask_secrets: bool = True) ->
         sanitized['environment'] = format_environment_name(sanitized['environment'])
 
     return sanitized
+
+
+def validate_deployment_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validates comprehensive deployment configuration.
+
+    Args:
+        config: Deployment configuration dictionary
+
+    Returns:
+        Validation result with errors and warnings
+
+    Examples:
+        >>> config = {"environment": "production", "replicas": 3}
+        >>> result = validate_deployment_config(config)
+        >>> result['valid']
+        True
+    """
+    errors = []
+    warnings = []
+
+    # Check required fields
+    required_fields = ['environment', 'commit_sha', 'replicas']
+    for field in required_fields:
+        if field not in config:
+            errors.append(f"Missing required field: {field}")
+
+    # Validate environment
+    if 'environment' in config:
+        env = config['environment']
+        if env not in ['production', 'staging', 'development']:
+            warnings.append(f"Non-standard environment: {env}")
+
+    # Validate replicas
+    if 'replicas' in config:
+        replicas = config['replicas']
+        if not isinstance(replicas, int) or replicas < 1:
+            errors.append("Replicas must be a positive integer")
+        if replicas > 10:
+            warnings.append("High replica count may consume excessive resources")
+
+    # Validate commit SHA
+    if 'commit_sha' in config:
+        if not validate_commit_sha(config['commit_sha']):
+            errors.append("Invalid commit SHA format")
+
+    return {
+        'valid': len(errors) == 0,
+        'errors': errors,
+        'warnings': warnings
+    }
+
+
+def generate_deployment_report(metadata: Dict[str, Any], detailed: bool = False) -> str:
+    """
+    Generates a formatted deployment report.
+
+    Args:
+        metadata: Deployment metadata dictionary
+        detailed: Whether to include detailed information
+
+    Returns:
+        Formatted report string
+
+    Examples:
+        >>> meta = {"environment": "production", "commit_sha": "abc123"}
+        >>> report = generate_deployment_report(meta)
+        >>> "production" in report
+        True
+    """
+    lines = []
+    lines.append("=" * 50)
+    lines.append("DEPLOYMENT REPORT")
+    lines.append("=" * 50)
+
+    if 'environment' in metadata:
+        lines.append(f"Environment: {metadata['environment'].upper()}")
+
+    if 'commit_sha' in metadata:
+        sha = metadata['commit_sha']
+        short_sha = extract_short_sha(sha) or sha[:7]
+        lines.append(f"Commit: {short_sha}")
+
+    if 'deployment_id' in metadata:
+        lines.append(f"Deployment ID: {metadata['deployment_id']}")
+
+    if detailed:
+        lines.append("")
+        lines.append("Detailed Information:")
+        lines.append("-" * 50)
+        for key, value in metadata.items():
+            if key not in ['environment', 'commit_sha', 'deployment_id']:
+                lines.append(f"  {key}: {value}")
+
+    lines.append("=" * 50)
+    return "\n".join(lines)
+
+
+def calculate_rollback_safety(current_deployment: Dict[str, Any], target_deployment: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Calculates safety metrics for rolling back to a previous deployment.
+
+    Args:
+        current_deployment: Current deployment metadata
+        target_deployment: Target deployment metadata for rollback
+
+    Returns:
+        Safety assessment with risk level and recommendations
+
+    Examples:
+        >>> current = {"deployment_id": "200", "build_timestamp": "2024-02-26T12:00:00Z"}
+        >>> target = {"deployment_id": "190", "build_timestamp": "2024-02-26T10:00:00Z"}
+        >>> safety = calculate_rollback_safety(current, target)
+        >>> safety['risk_level'] in ['low', 'medium', 'high']
+        True
+    """
+    risk_factors = []
+    recommendations = []
+
+    # Check deployment age difference
+    if 'build_timestamp' in current_deployment and 'build_timestamp' in target_deployment:
+        current_age = calculate_deployment_age(current_deployment['build_timestamp'])
+        target_age = calculate_deployment_age(target_deployment['build_timestamp'])
+
+        if current_age and target_age:
+            age_diff_hours = (target_age - current_age) / 3600
+            if age_diff_hours > 168:  # More than 1 week old
+                risk_factors.append("Target deployment is more than 1 week old")
+                recommendations.append("Consider deploying a newer version instead")
+
+    # Check environment match
+    if 'environment' in current_deployment and 'environment' in target_deployment:
+        if current_deployment['environment'] != target_deployment['environment']:
+            risk_factors.append("Environment mismatch detected")
+
+    # Check if rolling back to production
+    if 'environment' in target_deployment:
+        if is_production_environment(target_deployment['environment']):
+            risk_factors.append("Rolling back production deployment")
+            recommendations.append("Ensure proper testing and approval process")
+
+    # Determine risk level
+    if len(risk_factors) == 0:
+        risk_level = 'low'
+    elif len(risk_factors) <= 2:
+        risk_level = 'medium'
+    else:
+        risk_level = 'high'
+
+    return {
+        'risk_level': risk_level,
+        'risk_factors': risk_factors,
+        'recommendations': recommendations,
+        'safe_to_proceed': risk_level in ['low', 'medium']
+    }
+
+
+def parse_deployment_tags(tags: list) -> Dict[str, str]:
+    """
+    Parses deployment tags into a structured dictionary.
+
+    Args:
+        tags: List of tag strings in format "key:value"
+
+    Returns:
+        Dictionary of parsed tags
+
+    Examples:
+        >>> tags = ["team:backend", "version:2.1", "priority:high"]
+        >>> parsed = parse_deployment_tags(tags)
+        >>> parsed['team']
+        'backend'
+        >>> parsed['version']
+        '2.1'
+    """
+    result = {}
+
+    if not tags or not isinstance(tags, list):
+        return result
+
+    for tag in tags:
+        if not isinstance(tag, str) or ':' not in tag:
+            continue
+
+        parts = tag.split(':', 1)
+        if len(parts) == 2:
+            key, value = parts
+            result[key.strip()] = value.strip()
+
+    return result
