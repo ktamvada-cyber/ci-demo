@@ -1,0 +1,132 @@
+name: test-coverage
+
+# Run on all pushes (branches + tags) and pull requests
+# Creates a custom GitHub check run named "test-coverage" that gates deployments
+# Running on all branches/tags ensures every SHA has a coverage check for rollback/redeploy
+on:
+  pull_request:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write  # Required to create check run with coverage percentage
+
+jobs:
+  test-coverage:
+    name: coverage-tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests with coverage
+        id: run_tests
+        continue-on-error: true
+        run: |
+          # Run pytest with coverage threshold enforcement
+          # Exit code 0 = passed, non-zero = failed
+          pytest --cov=app \
+                 --cov-report=term-missing \
+                 --cov-report=json \
+                 --cov-fail-under=70 \
+                 -v
+
+      - name: Report coverage summary
+        id: coverage_summary
+        if: always()
+        run: |
+          echo "## Coverage Gate" >> $GITHUB_STEP_SUMMARY
+          if [ -f coverage.json ]; then
+            COVERAGE_PCT=$(python -c "import json; data=json.load(open('coverage.json')); print(f\"{data['totals']['percent_covered']:.1f}\")")
+            echo "📊 Coverage: ${COVERAGE_PCT}% (threshold: 70%)"
+            echo "- Coverage: **${COVERAGE_PCT}%** (threshold: 70%)" >> $GITHUB_STEP_SUMMARY
+
+            # Export coverage percentage as output for downstream workflows
+            echo "coverage_pct=${COVERAGE_PCT}" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ coverage.json not found"
+            echo "- coverage.json not found" >> $GITHUB_STEP_SUMMARY
+            echo "coverage_pct=0.0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create check run with coverage percentage
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const coveragePct = '${{ steps.coverage_summary.outputs.coverage_pct }}' || '0.0';
+            const threshold = 70.0;
+            const testsOk = '${{ steps.run_tests.outcome }}' === 'success';
+            const coverageOk = parseFloat(coveragePct) >= threshold;
+            const passed = testsOk && coverageOk;
+
+            // Determine the correct SHA to attach the check run to
+            // For pull_request events: use PR head SHA (github.event.pull_request.head.sha)
+            // For push/workflow_dispatch: use github.sha
+            let targetSha = context.sha;
+
+            if (context.eventName === 'pull_request' && context.payload.pull_request) {
+              targetSha = context.payload.pull_request.head.sha;
+              core.info(`Pull request event detected - using PR head SHA: ${targetSha}`);
+            } else {
+              core.info(`Using github.sha: ${targetSha}`);
+            }
+
+            // Create a descriptive title with coverage percentage
+            const emoji = passed ? '✅' : '❌';
+            const comparison = coverageOk ? `≥${threshold}%` : `<${threshold}%`;
+            const title = `${emoji} Coverage ${coveragePct}% (${comparison})`;
+
+            core.info(`Check run title: ${title}`);
+            core.info(`Tests passed: ${testsOk}, Coverage OK: ${coverageOk} (${coveragePct}% ${comparison}), Overall: ${passed}`);
+            core.info(`Creating check run for SHA: ${targetSha}`);
+
+            // Build summary with test results and coverage
+            let summary = `**Tests:** ${testsOk ? 'PASSED ✅' : 'FAILED ❌'}\n`;
+            summary += `**Coverage:** ${coveragePct}% (threshold: ${threshold}%) ${coverageOk ? '✅' : '❌'}\n`;
+            summary += `\n**Overall Status:** ${passed ? 'PASSED' : 'FAILED'}`;
+
+            try {
+              // Create our own check run with exact name "test-coverage"
+              const checkRun = await github.rest.checks.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'test-coverage',
+                head_sha: targetSha,
+                status: 'completed',
+                conclusion: passed ? 'success' : 'failure',
+                output: {
+                  title: title,
+                  summary: summary
+                }
+              });
+
+              core.info(`✅ Created check run ID: ${checkRun.data.id}`);
+              core.info(`Check run name: ${checkRun.data.name}`);
+              core.info(`Check run conclusion: ${checkRun.data.conclusion}`);
+            } catch (error) {
+              core.error(`Failed to create check run: ${error.message}`);
+              throw error;
+            }
+
+            // Also write to job summary for visibility
+            core.summary.addRaw(`### ${title}\n\n${summary}`).write();

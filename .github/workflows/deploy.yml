@@ -18,6 +18,7 @@ permissions:
   pull-requests: write  # Required to read PR metadata in issue_comment context
   issues: write         # Post deployment status comments
   deployments: write    # Create GitHub Deployments via API for correct ref tracking
+  checks: read          # Read check runs for coverage gate
 
 # Environment variables (workflow-level)
 env:
@@ -228,6 +229,149 @@ jobs:
               environment,
               description: `Deployment started for ${environment}`,
               log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+
+      # STEP 1.6: Verify Coverage Gate Passed
+      # COVERAGE GATE: Block deployment if coverage check missing or failed
+      # Queries GitHub Checks API for "test-coverage" check run (job name) on the PR SHA
+      # Deployment proceeds only if coverage check exists with conclusion=success
+      - name: Verify Coverage Gate
+        id: verify_coverage
+        if: steps.validate.outputs.should_deploy == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prSha = '${{ steps.validate.outputs.pr_sha }}';
+            const requiredCheckName = 'test-coverage';  // Must match job name in test-coverage.yml
+
+            core.info(`🔍 Checking coverage gate for SHA: ${prSha}`);
+
+            // Query ALL check runs on this SHA (do not use check_name filter to avoid API quirks)
+            const { data: allChecks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: prSha
+            });
+
+            core.info(`Found ${allChecks.total_count} total check runs for SHA ${prSha.substring(0, 7)}`);
+
+            // Filter to find the coverage check by exact name match
+            const coverageChecks = allChecks.check_runs.filter(check => check.name === requiredCheckName);
+
+            core.info(`Found ${coverageChecks.length} check runs with name="${requiredCheckName}"`);
+
+            // Verify coverage check exists
+            if (coverageChecks.length === 0) {
+              const errorMsg = `❌ COVERAGE GATE FAILED: No "${requiredCheckName}" check found for SHA ${prSha.substring(0, 7)}.\n\nCoverage tests must run before deployment.`;
+              core.setOutput('error_message', errorMsg);
+              core.setOutput('target_sha', prSha);
+              core.setFailed(errorMsg);
+              return { passed: false };
+            }
+
+            // Sort by completed_at (or started_at if not completed) descending to get most recent
+            const sortedChecks = coverageChecks.sort((a, b) => {
+              const timeA = new Date(a.completed_at || a.started_at || 0);
+              const timeB = new Date(b.completed_at || b.started_at || 0);
+              return timeB - timeA; // Newest first
+            });
+
+            // Get the most recent check run
+            const coverageCheck = sortedChecks[0];
+            core.info(`Using check run ID ${coverageCheck.id} (${coverageCheck.completed_at || coverageCheck.started_at})`);
+            core.info(`Check status: ${coverageCheck.status}, conclusion: ${coverageCheck.conclusion}`);
+
+            // Verify check is completed
+            if (coverageCheck.status !== 'completed') {
+              const statusMsg = coverageCheck.status === 'in_progress' ? 'still running' : coverageCheck.status;
+              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check is ${statusMsg}. Wait for coverage tests to complete.\n\nCheck: ${coverageCheck.html_url}`;
+              core.setOutput('error_message', errorMsg);
+              core.setOutput('target_sha', prSha);
+              core.setOutput('check_url', coverageCheck.html_url);
+              core.setFailed(errorMsg);
+              return { passed: false };
+            }
+
+            // Verify check passed
+            if (coverageCheck.conclusion !== 'success') {
+              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check ${coverageCheck.conclusion}. Coverage must be ≥70% to deploy.\n\nCheck: ${coverageCheck.html_url}`;
+              core.setOutput('error_message', errorMsg);
+              core.setOutput('target_sha', prSha);
+              core.setOutput('check_url', coverageCheck.html_url);
+              core.setFailed(errorMsg);
+              return { passed: false };
+            }
+
+            // Extract coverage percentage from check run output (if available)
+            let coveragePct = 'N/A';
+            if (coverageCheck.output && coverageCheck.output.title) {
+              // Parse coverage from title like "✅ Coverage 74.0% (≥70%)"
+              const match = coverageCheck.output.title.match(/Coverage\s+([\d.]+)%/);
+              if (match) {
+                coveragePct = match[1];
+                core.info(`Extracted coverage: ${coveragePct}%`);
+              }
+            }
+
+            core.info(`✅ Coverage gate passed`);
+            core.setOutput('coverage_check_url', coverageCheck.html_url);
+            core.setOutput('coverage_pct', coveragePct);
+            core.setOutput('target_sha', prSha);
+
+            return { passed: true, coveragePct };
+
+      # STEP 1.7: Post coverage gate failure message
+      # Runs if coverage gate check failed
+      # Provides immediate feedback in PR about coverage requirements
+      - name: Post Coverage Gate Failure
+        if: always() && steps.verify_coverage.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errorMessage = '${{ steps.verify_coverage.outputs.error_message }}';
+            const targetSha = '${{ steps.verify_coverage.outputs.target_sha }}';
+            const checkUrl = '${{ steps.verify_coverage.outputs.check_url }}';
+            const coveragePct = '${{ steps.verify_coverage.outputs.coverage_pct }}' || 'N/A';
+
+            let coverageInfo = '';
+            if (coveragePct !== 'N/A') {
+              coverageInfo = `\n**Current coverage:** ${coveragePct}% (threshold: 70%)\n`;
+            }
+
+            const comment = `### ❌ Deployment Blocked - Coverage Gate Failed
+
+            **Error Details:**
+
+            ${errorMessage || '❌ Coverage gate check failed - see workflow logs'}
+            ${coverageInfo}
+            ---
+
+            #### 📊 Coverage Requirements
+
+            Deployments require:
+            - ✅ Coverage tests must run on target SHA: \`${targetSha.substring(0, 7)}\`
+            - ✅ Coverage must be ≥70%
+            - ✅ All tests must pass
+            - ✅ Check "test-coverage" must complete with success
+
+            #### 🔧 How to Fix
+
+            1. Push changes to your branch to trigger coverage tests
+            2. Verify tests pass with ≥70% coverage
+            3. Wait for "test-coverage" check to complete successfully
+            4. Retry deployment with \`[staging]\` or \`[prod]\`
+
+            ${checkUrl ? `**Check run:** ${checkUrl}` : ''}
+
+            ---
+            📋 **View Deployment Workflow:** [Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
             });
 
       # STEP 2: Post validation failure message

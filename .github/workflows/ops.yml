@@ -31,7 +31,7 @@ on:
           - redeploy
           - rollback
       sha:
-        description: 'Target commit SHA (required for rollback unless steps provided)'
+        description: 'Target commit SHA, tag, or branch (e.g., abc123..., v1.2.3, main). Required for redeploy/rollback unless steps provided.'
         required: false
         type: string
       steps:
@@ -70,6 +70,7 @@ permissions:
   issues: write         # Post ops status comments to Ops Console issue
   deployments: write    # Create GitHub Deployments via API for tracking
   pull-requests: read   # Not strictly required but included for consistency
+  checks: read          # Read check runs for coverage gate
 
 # Concurrency control: Only ONE ops operation at a time across all environments
 # Cancel any in-progress ops action when a new one is triggered
@@ -163,12 +164,15 @@ jobs:
               // [prod-restart]
               // [staging-redeploy]
               // [prod-redeploy confirm=yes]
-              // [staging-rollback sha=<40hex>]
-              // [prod-rollback sha=<40hex> confirm=yes]
+              // [staging-rollback sha=<sha|tag|ref>]
+              // [prod-rollback sha=<sha|tag|ref> confirm=yes]
               // [staging-rollback steps=<int>]
               // [prod-rollback steps=<int> confirm=yes]
+              //
+              // SHA accepts: 40-char hex, tags (v1.2.3), branches (main), or refs (refs/tags/v1.0.0)
+              // Tags/refs will be resolved to commit SHAs before deployment
 
-              const commandRegex = /^\[(staging|prod)-(restart|redeploy|rollback)(?:\s+sha=([a-f0-9]{40}))?(?:\s+steps=(\d+))?(?:\s+confirm=(yes))?\]$/;
+              const commandRegex = /^\[(staging|prod)-(restart|redeploy|rollback)(?:\s+sha=([^\s\]]+))?(?:\s+steps=(\d+))?(?:\s+confirm=(yes))?\]$/;
               const match = comment.match(commandRegex);
 
               if (!match) {
@@ -176,11 +180,14 @@ jobs:
                   `  [staging-restart]\n` +
                   `  [prod-restart]\n` +
                   `  [staging-redeploy]\n` +
+                  `  [staging-redeploy sha=<sha|tag|ref>]\n` +
                   `  [prod-redeploy confirm=yes]\n` +
-                  `  [staging-rollback sha=<40hex>]\n` +
+                  `  [prod-redeploy sha=<sha|tag|ref> confirm=yes]\n` +
+                  `  [staging-rollback sha=<sha|tag|ref>]\n` +
                   `  [staging-rollback steps=<int>]\n` +
-                  `  [prod-rollback sha=<40hex> confirm=yes]\n` +
-                  `  [prod-rollback steps=<int> confirm=yes]`;
+                  `  [prod-rollback sha=<sha|tag|ref> confirm=yes]\n` +
+                  `  [prod-rollback steps=<int> confirm=yes]\n` +
+                  `\nNote: sha= accepts commit SHAs, tags (v1.2.3), or branch names`;
                 core.setOutput('error_message', errorMsg);
                 core.setOutput('should_run', 'false');
                 core.info('Invalid command syntax');
@@ -333,6 +340,186 @@ jobs:
               body: comment
             });
 
+      # STEP 2.5: Resolve Ref/Tag to SHA
+      # If target_sha is provided, resolve it to a 40-char commit SHA
+      # Accepts: 40-char SHA (pass-through), tags (v1.2.3), branches (main), or refs (refs/tags/v1.0.0)
+      # This ensures the coverage gate always checks a real commit SHA
+      - name: Resolve Ref to SHA
+        id: resolve_sha
+        if: |
+          steps.validate.outputs.should_run == 'true' &&
+          steps.validate.outputs.target_sha != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const inputRef = '${{ steps.validate.outputs.target_sha }}';
+            const action = '${{ steps.validate.outputs.action }}';
+
+            core.info(`🔍 Resolving ref to SHA: ${inputRef}`);
+
+            // Check if input is already a 40-char hex SHA
+            if (/^[a-f0-9]{40}$/.test(inputRef)) {
+              core.info(`✅ Input is already a 40-char SHA: ${inputRef}`);
+              core.setOutput('resolved_sha', inputRef);
+              core.setOutput('is_tag', 'false');
+              core.setOutput('original_ref', inputRef);
+              return { resolvedSha: inputRef, isTag: false };
+            }
+
+            core.info(`📌 Input is a ref/tag/branch, resolving to commit SHA...`);
+
+            try {
+              // Try to resolve as a ref (handles tags, branches, etc.)
+              // First try refs/tags/<input> (most common for version tags)
+              let resolvedSha = '';
+              let refType = '';
+
+              try {
+                const { data: tagRef } = await github.rest.git.getRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `tags/${inputRef}`
+                });
+
+                // For annotated tags, tagRef.object.sha is the tag object SHA
+                // We need to dereference to get the commit SHA
+                if (tagRef.object.type === 'tag') {
+                  const { data: tagObject } = await github.rest.git.getTag({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    tag_sha: tagRef.object.sha
+                  });
+                  resolvedSha = tagObject.object.sha;
+                  refType = 'annotated tag';
+                } else {
+                  resolvedSha = tagRef.object.sha;
+                  refType = 'lightweight tag';
+                }
+
+                core.info(`✅ Resolved tag "${inputRef}" (${refType}) to commit SHA: ${resolvedSha}`);
+              } catch (tagError) {
+                // Tag not found, try as a branch
+                try {
+                  const { data: branchRef } = await github.rest.git.getRef({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    ref: `heads/${inputRef}`
+                  });
+                  resolvedSha = branchRef.object.sha;
+                  refType = 'branch';
+                  core.info(`✅ Resolved branch "${inputRef}" to commit SHA: ${resolvedSha}`);
+                } catch (branchError) {
+                  // Not a tag or branch, try as a raw ref (e.g., refs/pull/123/head)
+                  try {
+                    const { data: rawRef } = await github.rest.git.getRef({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      ref: inputRef
+                    });
+                    resolvedSha = rawRef.object.sha;
+                    refType = 'raw ref';
+                    core.info(`✅ Resolved ref "${inputRef}" to commit SHA: ${resolvedSha}`);
+                  } catch (refError) {
+                    // Last resort: try to get commit directly (handles short SHAs)
+                    try {
+                      const { data: commit } = await github.rest.repos.getCommit({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        ref: inputRef
+                      });
+                      resolvedSha = commit.sha;
+                      refType = 'commit';
+                      core.info(`✅ Resolved commit "${inputRef}" to full SHA: ${resolvedSha}`);
+                    } catch (commitError) {
+                      const errorMsg = `❌ REF RESOLUTION FAILED: Could not resolve "${inputRef}" to a commit SHA.\n\nTried: tag, branch, ref, commit.\n\nPlease provide a valid commit SHA, tag, or branch name.`;
+                      core.setOutput('error_message', errorMsg);
+                      core.setOutput('original_ref', inputRef);
+                      core.setFailed(errorMsg);
+                      return { error: errorMsg };
+                    }
+                  }
+                }
+              }
+
+              // Verify resolved SHA is a valid 40-char hex string
+              if (!/^[a-f0-9]{40}$/.test(resolvedSha)) {
+                const errorMsg = `❌ REF RESOLUTION FAILED: Resolved SHA "${resolvedSha}" is not a valid 40-char hex string.`;
+                core.setOutput('error_message', errorMsg);
+                core.setOutput('original_ref', inputRef);
+                core.setFailed(errorMsg);
+                return { error: errorMsg };
+              }
+
+              core.setOutput('resolved_sha', resolvedSha);
+              core.setOutput('is_tag', refType.includes('tag') ? 'true' : 'false');
+              core.setOutput('original_ref', inputRef);
+              core.setOutput('ref_type', refType);
+
+              core.info(`✅ Ref resolution complete: ${inputRef} (${refType}) → ${resolvedSha}`);
+
+              return {
+                resolvedSha,
+                isTag: refType.includes('tag'),
+                refType,
+                originalRef: inputRef
+              };
+
+            } catch (error) {
+              const errorMsg = `❌ REF RESOLUTION ERROR: ${error.message}`;
+              core.setOutput('error_message', errorMsg);
+              core.setOutput('original_ref', inputRef);
+              core.setFailed(errorMsg);
+              return { error: errorMsg };
+            }
+
+      # STEP 2.6: Post ref resolution failure message
+      # Runs if ref resolution failed
+      - name: Post Ref Resolution Failure
+        if: always() && steps.resolve_sha.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errorMessage = '${{ steps.resolve_sha.outputs.error_message }}';
+            const originalRef = '${{ steps.resolve_sha.outputs.original_ref }}';
+            const opsIssueNumber = Number(process.env.OPS_ISSUE_NUMBER);
+            const isWorkflowDispatch = context.eventName === 'workflow_dispatch';
+            const action = '${{ steps.validate.outputs.action }}';
+
+            const comment = `### ❌ ${action.charAt(0).toUpperCase() + action.slice(1)} Blocked - Ref Resolution Failed
+
+            **Error Details:**
+
+            ${errorMessage || '❌ Failed to resolve ref to commit SHA - see workflow logs'}
+
+            ---
+
+            #### 🔧 How to Fix
+
+            1. Verify the ref/tag/branch exists: \`${originalRef}\`
+            2. Check for typos in the ref name
+            3. Use a valid commit SHA, tag name, or branch name
+            4. Retry the operation with a valid ref
+
+            **Examples:**
+            - Commit SHA: \`abc123...def\` (40 chars)
+            - Tag: \`v1.2.3\`
+            - Branch: \`main\`
+
+            ---
+            📋 **View Ops Workflow:** [Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `;
+
+            // For workflow_dispatch, try to post to ops console
+            // For issue_comment, post to the same issue (which should be ops console)
+            const targetIssue = isWorkflowDispatch ? opsIssueNumber : context.issue.number;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: targetIssue,
+              body: comment
+            });
+
       # STEP 3: Determine current SHA from running container
       # Extract current SHA and image reference for rollback calculations
       - name: Determine Current SHA
@@ -369,12 +556,15 @@ jobs:
       # STEP 4: Compute Rollback Target (GitHub Deployments API)
       # PRIMARY source of truth for rollback-by-steps
       # Query GitHub Deployments API to find previous successful deployments
+      # Only runs when: rollback action + no SHA provided + resolve_sha was skipped (not failed)
+      # If resolve_sha failed, the workflow should have already exited with error
       - name: Compute Rollback Target (GitHub Deployments API)
         id: compute_rollback_api
         if: |
           steps.validate.outputs.should_run == 'true' &&
           steps.validate.outputs.action == 'rollback' &&
-          steps.validate.outputs.target_sha == ''
+          steps.validate.outputs.target_sha == '' &&
+          steps.resolve_sha.outcome == 'skipped'
         uses: actions/github-script@v7
         with:
           script: |
@@ -525,8 +715,8 @@ jobs:
 
       # STEP 5: Determine target SHA for operation
       # For restart: infer SHA from running container
-      # For redeploy: use provided SHA or infer from running container
-      # For rollback: use provided SHA, API result, or local history fallback
+      # For redeploy: use resolved SHA (from tag/ref) or infer from running container
+      # For rollback: use resolved SHA (from tag/ref), API result, or local history fallback
       - name: Determine Target SHA
         id: determine_sha
         if: steps.validate.outputs.should_run == 'true'
@@ -534,7 +724,8 @@ jobs:
           ACTION: ${{ steps.validate.outputs.action }}
           ENVIRONMENT: ${{ steps.validate.outputs.environment }}
           CONTAINER_NAME: ${{ steps.validate.outputs.container_name }}
-          TARGET_SHA: ${{ steps.validate.outputs.target_sha }}
+          TARGET_SHA: ${{ steps.resolve_sha.outputs.resolved_sha || steps.validate.outputs.target_sha }}
+          ORIGINAL_REF: ${{ steps.resolve_sha.outputs.original_ref || steps.validate.outputs.target_sha }}
           STEPS: ${{ steps.validate.outputs.steps }}
           CURRENT_SHA: ${{ steps.determine_current.outputs.current_sha }}
           CURRENT_IMAGE: ${{ steps.determine_current.outputs.current_image }}
@@ -557,12 +748,17 @@ jobs:
             if [ -n "$TARGET_SHA" ]; then
               FINAL_SHA="$TARGET_SHA"
               FINAL_IMAGE_REF="${IMAGE_NAME}:${FINAL_SHA}"
-              echo "🎯 Redeploy with provided SHA: ${FINAL_SHA}"
+              if [ -n "$ORIGINAL_REF" ] && [ "$ORIGINAL_REF" != "$TARGET_SHA" ]; then
+                echo "🎯 Redeploy with SHA from ${ORIGINAL_REF}: ${FINAL_SHA}"
+              else
+                echo "🎯 Redeploy with provided SHA: ${FINAL_SHA}"
+              fi
             else
               # Use current container's image (allow redeploy from inferred image)
               if [ -z "$CURRENT_IMAGE" ]; then
                 echo "❌ ERROR: Cannot redeploy without target SHA when no container is running"
-                echo "   Please provide sha=<40hex> or ensure a container is currently running"
+                echo "   Please provide sha=<sha|tag|ref> or ensure a container is currently running"
+                echo "   Examples: sha=abc123...def, sha=v1.2.3, sha=main"
                 exit 1
               fi
               FINAL_SHA="${CURRENT_SHA}"
@@ -571,10 +767,14 @@ jobs:
             fi
 
           elif [ "$ACTION" = "rollback" ]; then
-            # For rollback, prioritize: provided SHA > API result > local history
+            # For rollback, prioritize: provided SHA (resolved from tag/ref) > API result > local history
             if [ -n "$TARGET_SHA" ]; then
               FINAL_SHA="$TARGET_SHA"
-              echo "🎯 Rollback to provided SHA: ${FINAL_SHA}"
+              if [ -n "$ORIGINAL_REF" ] && [ "$ORIGINAL_REF" != "$TARGET_SHA" ]; then
+                echo "🎯 Rollback to SHA from ${ORIGINAL_REF}: ${FINAL_SHA}"
+              else
+                echo "🎯 Rollback to provided SHA: ${FINAL_SHA}"
+              fi
 
             elif [ "$USED_API" = "true" ] && [ -n "$API_TARGET_SHA" ]; then
               # Use API result (PRIMARY source of truth)
@@ -695,6 +895,166 @@ jobs:
           echo "final_image_ref=${FINAL_IMAGE_REF}" >> $GITHUB_OUTPUT
 
           echo "✅ Target determined: SHA=${FINAL_SHA:-'(from image)'} Image=${FINAL_IMAGE_REF:-'N/A'}"
+
+      # STEP 5.5: Verify Coverage Gate Passed
+      # COVERAGE GATE: Block redeploy/rollback if coverage check missing or failed
+      # Queries GitHub Checks API for "test-coverage" check run (job name) on the target SHA
+      # Skips for restart operations (no new code deployment)
+      - name: Verify Coverage Gate
+        id: verify_coverage
+        if: |
+          steps.validate.outputs.should_run == 'true' &&
+          (steps.validate.outputs.action == 'redeploy' || steps.validate.outputs.action == 'rollback') &&
+          steps.determine_sha.outputs.final_sha != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const targetSha = '${{ steps.determine_sha.outputs.final_sha }}';
+            const action = '${{ steps.validate.outputs.action }}';
+            const originalRef = '${{ steps.resolve_sha.outputs.original_ref }}';
+            const isResolved = originalRef && originalRef !== targetSha;
+            const requiredCheckName = 'test-coverage';  // Must match job name in test-coverage.yml
+
+            if (isResolved) {
+              core.info(`🔍 Checking coverage gate for ${action} to ${originalRef} → ${targetSha}`);
+            } else {
+              core.info(`🔍 Checking coverage gate for ${action} to SHA: ${targetSha}`);
+            }
+
+            // Query ALL check runs on this SHA (do not use check_name filter to avoid API quirks)
+            const { data: allChecks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: targetSha
+            });
+
+            core.info(`Found ${allChecks.total_count} total check runs for SHA ${targetSha.substring(0, 7)}`);
+
+            // Filter to find the coverage check by exact name match
+            const coverageChecks = allChecks.check_runs.filter(check => check.name === requiredCheckName);
+
+            core.info(`Found ${coverageChecks.length} check runs with name="${requiredCheckName}"`);
+
+            // Verify coverage check exists
+            if (coverageChecks.length === 0) {
+              const errorMsg = `❌ COVERAGE GATE FAILED: No "${requiredCheckName}" check found for SHA ${targetSha.substring(0, 7)}.\n\nCoverage tests must run before ${action}.`;
+              core.setOutput('error_message', errorMsg);
+              core.setOutput('target_sha', targetSha);
+              core.setFailed(errorMsg);
+              return { passed: false };
+            }
+
+            // Sort by completed_at (or started_at if not completed) descending to get most recent
+            const sortedChecks = coverageChecks.sort((a, b) => {
+              const timeA = new Date(a.completed_at || a.started_at || 0);
+              const timeB = new Date(b.completed_at || b.started_at || 0);
+              return timeB - timeA; // Newest first
+            });
+
+            // Get the most recent check run
+            const coverageCheck = sortedChecks[0];
+            core.info(`Using check run ID ${coverageCheck.id} (${coverageCheck.completed_at || coverageCheck.started_at})`);
+            core.info(`Check status: ${coverageCheck.status}, conclusion: ${coverageCheck.conclusion}`);
+
+            // Verify check is completed
+            if (coverageCheck.status !== 'completed') {
+              const statusMsg = coverageCheck.status === 'in_progress' ? 'still running' : coverageCheck.status;
+              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check is ${statusMsg}. Wait for coverage tests to complete.\n\nCheck: ${coverageCheck.html_url}`;
+              core.setOutput('error_message', errorMsg);
+              core.setOutput('target_sha', targetSha);
+              core.setOutput('check_url', coverageCheck.html_url);
+              core.setFailed(errorMsg);
+              return { passed: false };
+            }
+
+            // Verify check passed
+            if (coverageCheck.conclusion !== 'success') {
+              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check ${coverageCheck.conclusion}. Coverage must be ≥70% for ${action}.\n\nCheck: ${coverageCheck.html_url}`;
+              core.setOutput('error_message', errorMsg);
+              core.setOutput('target_sha', targetSha);
+              core.setOutput('check_url', coverageCheck.html_url);
+              core.setFailed(errorMsg);
+              return { passed: false };
+            }
+
+            // Extract coverage percentage from check run output (if available)
+            let coveragePct = 'N/A';
+            if (coverageCheck.output && coverageCheck.output.title) {
+              // Parse coverage from title like "✅ Coverage 74.0% (≥70%)"
+              const match = coverageCheck.output.title.match(/Coverage\s+([\d.]+)%/);
+              if (match) {
+                coveragePct = match[1];
+                core.info(`Extracted coverage: ${coveragePct}%`);
+              }
+            }
+
+            core.info(`✅ Coverage gate passed`);
+            core.setOutput('coverage_check_url', coverageCheck.html_url);
+            core.setOutput('coverage_pct', coveragePct);
+            core.setOutput('target_sha', targetSha);
+
+            return { passed: true, coveragePct };
+
+      # STEP 5.6: Post coverage gate failure message
+      # Runs if coverage gate check failed for redeploy/rollback
+      # Provides immediate feedback to Ops Console about coverage requirements
+      - name: Post Coverage Gate Failure
+        if: always() && steps.verify_coverage.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errorMessage = '${{ steps.verify_coverage.outputs.error_message }}';
+            const opsIssueNumber = Number(process.env.OPS_ISSUE_NUMBER);
+            const isWorkflowDispatch = context.eventName === 'workflow_dispatch';
+            const action = '${{ steps.validate.outputs.action }}';
+            const targetSha = '${{ steps.verify_coverage.outputs.target_sha }}';
+            const checkUrl = '${{ steps.verify_coverage.outputs.check_url }}';
+            const coveragePct = '${{ steps.verify_coverage.outputs.coverage_pct }}' || 'N/A';
+
+            let coverageInfo = '';
+            if (coveragePct !== 'N/A') {
+              coverageInfo = `\n**Current coverage:** ${coveragePct}% (threshold: 70%)\n`;
+            }
+
+            const comment = `### ❌ ${action.charAt(0).toUpperCase() + action.slice(1)} Blocked - Coverage Gate Failed
+
+            **Error Details:**
+
+            ${errorMessage || '❌ Coverage gate check failed - see workflow logs'}
+            ${coverageInfo}
+            ---
+
+            #### 📊 Coverage Requirements
+
+            Operations require:
+            - ✅ Coverage tests must run on target SHA: \`${targetSha.substring(0, 7)}\`
+            - ✅ Coverage must be ≥70%
+            - ✅ All tests must pass
+            - ✅ Check "test-coverage" must complete with success
+
+            #### 🔧 How to Fix
+
+            1. Ensure the target SHA has coverage tests run
+            2. Verify tests pass with ≥70% coverage
+            3. Wait for "test-coverage" check to complete successfully
+            4. Retry the operation
+
+            ${checkUrl ? `**Check run:** ${checkUrl}` : ''}
+
+            ---
+            📋 **View Ops Workflow:** [Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `;
+
+            // For workflow_dispatch, post to ops console
+            // For issue_comment, post to the same issue (which should be ops console)
+            const targetIssue = isWorkflowDispatch ? opsIssueNumber : context.issue.number;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: targetIssue,
+              body: comment
+            });
 
       # STEP 6: Create GitHub Deployment record
       # Creates a deployment tied to the target SHA for tracking
