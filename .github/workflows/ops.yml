@@ -53,6 +53,16 @@ env:
   # TODO: Create a pinned "Ops Console" issue and set the number here
   OPS_ISSUE_NUMBER: 2
 
+  # Deployment configuration constants
+  STAGING_PORT: 8001
+  PROD_PORT: 8002
+  STAGING_CONTAINER: myapp-staging
+  PROD_CONTAINER: myapp-prod
+  IMAGE_NAME: ci-demo
+  CONTAINER_INTERNAL_PORT: 8000
+  HEALTH_CHECK_MAX_RETRIES: 10
+  HEALTH_CHECK_RETRY_SLEEP: 2
+
 # Explicit permissions following principle of least privilege
 # This workflow can only read code and write to issues/deployments - cannot push code or modify settings
 permissions:
@@ -771,6 +781,11 @@ jobs:
             core.info(`   Action: ${action}`);
             core.info(`   Requester: ${requester}`);
 
+            // Cache branch/PR info for reuse in Update Deployment Status step
+            core.setOutput('branch_name', branchName);
+            core.setOutput('pr_number', prNumber || '');
+            core.setOutput('deployment_sha', ref);
+
             const { data: deployment } = await github.rest.repos.createDeployment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -1149,56 +1164,12 @@ jobs:
             const currentSha = '${{ steps.determine_current.outputs.current_sha }}';
             const jobStatus = '${{ job.status }}';
 
-            // Find which branch/PR the deployment SHA belongs to
-            const deploymentSha = finalSha || currentSha || context.sha;
+            // Reuse cached branch/PR info from Create Deployment step (avoids duplicate API calls)
+            const branchName = '${{ steps.create_deployment.outputs.branch_name }}' || 'unknown';
+            const deploymentSha = '${{ steps.create_deployment.outputs.deployment_sha }}';
             const shortSha = deploymentSha.substring(0, 7);
 
-            let branchName = 'unknown';
-            try {
-              // Try strategies: PR lookup -> branch HEAD -> deployment history
-              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                commit_sha: deploymentSha
-              });
-
-              if (prs.length > 0) {
-                branchName = prs[0].head.ref;
-              } else {
-                const { data: branches } = await github.rest.repos.listBranchesForHeadCommit({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  commit_sha: deploymentSha
-                });
-
-                if (branches.length > 0) {
-                  const mainBranch = branches.find(b => b.name === 'main' || b.name === 'master');
-                  branchName = mainBranch ? mainBranch.name : branches[0].name;
-                } else {
-                  // Check deployment history
-                  const { data: existingDeployments } = await github.rest.repos.listDeployments({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    sha: deploymentSha,
-                    per_page: 10
-                  });
-
-                  for (const dep of existingDeployments) {
-                    if (dep.payload?.pr_branch) {
-                      branchName = dep.payload.pr_branch;
-                      break;
-                    }
-                  }
-
-                  if (branchName === 'unknown') {
-                    branchName = context.ref.replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '');
-                  }
-                }
-              }
-            } catch (error) {
-              core.warning(`Failed to lookup branch for ${shortSha}: ${error.message}`);
-              branchName = context.ref.replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '');
-            }
+            core.info(`Using cached branch info: ${branchName} for ${shortSha}`);
 
             // Sanitizer to remove 4-byte Unicode characters (emoji) that GitHub API rejects
             const sanitize = (s) => Array.from(s)
