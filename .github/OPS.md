@@ -139,13 +139,25 @@ A GitHub Actions workflow that provides operational control over deployed applic
 1. Query all deployments for repository
 2. Filter by target environment (staging or production)
 3. For each deployment, check its statuses
-4. Keep only deployments with at least one "success" status
+4. Keep only deployments that EVER achieved a "success" status
+   - Uses `statuses.some(s => s.state === 'success')` pattern
+   - Accounts for deployments marked "inactive" by `auto_inactive:true`
+   - A deployment with status history `[inactive, success, in_progress]` is ACCEPTED
 5. Build deduplicated array of successful deployment SHAs (newest first)
 6. Calculate target index:
    - If current SHA found in history: `targetIndex = currentIndex + stepsBack`
    - If current SHA not found (baseline case): `targetIndex = stepsBack` (treat newest as index 0)
 7. Validate bounds: ensure targetIndex < array length
 8. Return SHA at targetIndex
+
+**Important: ref field is always a SHA**
+
+Ops workflow ALWAYS creates deployments with `ref=<40-hex-sha>`, never branch names.
+This ensures all ops.yml deployments are valid rollback targets.
+
+Priority fallback order: `finalSha (target) → currentSha (running) → context.sha (workflow)`
+
+This prevents "ref=main" pollution that would make deployments unavailable for rollback.
 
 **Fallback: Local history files**
 
@@ -163,6 +175,77 @@ A GitHub Actions workflow that provides operational control over deployed applic
 - GitHub Deployments API is authoritative but may be incomplete (older repos, manual deployments)
 - Local history provides complete audit trail on runner machine
 - Fallback ensures rollback works even if API data is unavailable
+
+---
+
+## Deployment Record Structure
+
+### GitHub Deployments API Fields
+
+Every ops workflow operation creates a GitHub Deployment record with full branch/PR tracking:
+
+**Core Fields:**
+- **ref**: Always a 40-character commit SHA (never branch names like "main")
+- **task**: Format `branch:action` (e.g., "feature_1:restart", "main:rollback")
+  - Visible in GitHub Deployments UI list view
+  - Provides at-a-glance branch identification
+- **environment**: "staging" or "production"
+- **description**: Human-readable summary with branch and SHA
+  - Format: `Ops {action} to {environment} by {user} (branch@sha)`
+  - Example: "Ops restart to staging by ktamvada-cyber (feature_1@abc1234)"
+
+**Payload Structure:**
+```javascript
+{
+  action: "restart" | "redeploy" | "rollback",
+  pr_number: "123" or null,           // PR number if SHA belongs to a PR
+  pr_branch: "feature_1",             // Branch name from multi-strategy lookup
+  target_sha: "abc123...",            // Target SHA for redeploy/rollback (empty for restart)
+  current_image: "ci-demo:abc123...", // Currently running Docker image
+  triggered_by: "username",           // GitHub user who triggered operation
+  ops_workflow_run: "12345"           // GitHub Actions run ID
+}
+```
+
+### Branch/PR Tracking Strategy
+
+The workflow uses a 3-tier lookup to determine which branch a SHA belongs to:
+
+**Strategy 1: PR Association (Preferred)**
+- Calls `listPullRequestsAssociatedWithCommit` API
+- Gets both PR number and branch name
+- Enables GitHub UI to show "(#123)" next to deployments
+
+**Strategy 2: Branch HEAD Lookup**
+- Calls `listBranchesForHeadCommit` API
+- Finds which branch currently points to this SHA
+- Prefers main/master if SHA exists on multiple branches
+
+**Strategy 3: Deployment History**
+- Queries existing deployments for the same SHA
+- Extracts `pr_branch` from previous deployment payload
+- Useful for historical commits no longer at branch HEAD
+
+**Strategy 4: Fallback**
+- Uses workflow trigger branch (context.ref)
+- Ensures every deployment has branch information
+
+### GitHub UI Visibility
+
+Deployments appear in GitHub with full context:
+
+**List View:**
+- **Task**: "feature_1:restart" ← Branch visible at a glance
+- **Commit Message**: From the git commit
+- **PR Reference**: "(#123)" if pr_number is set in payload
+- **Environment**: staging/production badge
+- **SHA**: Short commit hash
+
+**Detail View:**
+- **Description**: Full "Ops restart to staging by user (feature_1@abc1234)"
+- **Status History**: All deployment statuses with timestamps
+- **Payload**: Complete JSON with pr_number, pr_branch, etc.
+- **Environment URL**: Direct link to deployed service
 
 ---
 
@@ -210,7 +293,7 @@ Same as deploy.yml workflow. Containers must be running:
 
 **Configure OPS_ISSUE_NUMBER in workflow:**
 
-Edit `.github/workflows/ops.yml` line 51:
+Edit `.github/workflows/ops.yml` line 54:
 ```yaml
 env:
   OPS_ISSUE_NUMBER: 2  # Replace with your Ops Console issue number
@@ -235,7 +318,7 @@ Same as deploy.yml workflow. Ensure `staging` and `production` environments have
 
 ### 6. Authorized Users
 
-Authorization allowlists are defined in workflow (lines 80-88 in ops.yml):
+Authorization allowlists are defined in workflow (lines 220-228 in ops.yml):
 
 ```javascript
 const stagingAuthorizedUsers = [
@@ -418,7 +501,7 @@ Confirm: yes
 
 ### Issue-Based Access Control
 
-**OPS_ISSUE_NUMBER restriction (line 51 in ops.yml):**
+**OPS_ISSUE_NUMBER restriction (line 54 in ops.yml):**
 
 Only commands posted on the designated Ops Console issue are processed. Commands on other issues are rejected:
 
@@ -431,7 +514,7 @@ This comment was posted on issue #5
 
 ### Authorization Allowlists
 
-Same allowlists as deploy.yml workflow (lines 80-88):
+Same allowlists as deploy.yml workflow (lines 220-228):
 - Staging: ktamvada-cyber, gromag
 - Production: ktamvada-cyber, gromag
 
@@ -461,7 +544,7 @@ Rejection message:
 
 ### Command Injection Prevention
 
-Strict regex validation (line 112 in ops.yml):
+Strict regex validation (line 161 in ops.yml):
 
 ```javascript
 const commandRegex = /^\[(staging|prod)-(restart|redeploy|rollback)(?:\s+sha=([a-f0-9]{40}))?(?:\s+steps=(\d+))?(?:\s+confirm=(yes))?\]$/;
@@ -493,7 +576,7 @@ For `issue_comment` trigger, GitHub always runs workflow from default branch (ma
 
 ## Concurrency Model
 
-Configuration (lines 58-60 in ops.yml):
+Configuration (lines 67-69 in ops.yml):
 
 ```yaml
 concurrency:
@@ -1005,7 +1088,7 @@ mv /tmp/myapp-staging.history.tmp /tmp/myapp-staging.history
 - ktamvada-cyber
 - gromag
 
-(Edit workflow lines 80-88 to customize)
+(Edit workflow lines 220-228 to customize)
 
 ### File Locations
 

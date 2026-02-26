@@ -178,8 +178,30 @@ A GitHub Actions workflow that deploys code to local Docker containers when auth
 This workflow creates GitHub Deployment records via API to track deployments correctly:
 - Deployments are tied to the PR head SHA (not main branch)
 - Visible in GitHub UI: Repository → Environments → staging/production
-- Each deployment shows: commit SHA, status, environment URL, workflow logs (PR branch info in description/payload)
+- Each deployment shows: commit SHA, status, environment URL, workflow logs
 - Note: Two deployment records are created (one from job-level `environment:` for approval gates, one from API for correct ref tracking)
+
+**Deployment Record Structure:**
+
+Each deployment includes complete PR/branch tracking:
+
+- **ref**: PR head SHA (40-character commit hash)
+- **task**: `{branch}:deploy` (e.g., "feature_1:deploy") - visible in GitHub UI list
+- **description**: `Deploy PR #{number} ({branch}) to {environment} via comment trigger`
+- **payload**: Complete metadata for audit trail
+  ```javascript
+  {
+    pr_number: "123",               // PR number
+    pr_branch: "feature_1",         // Branch name
+    pr_sha: "abc123...",            // Commit SHA
+    triggered_by: "username",       // User who commented
+    comment_id: "456789"            // Triggering comment ID
+  }
+  ```
+
+**GitHub UI Display:**
+- **List View**: Shows task ("feature_1:deploy"), PR number "(#123)", commit message, environment
+- **Detail View**: Full description, status history, complete payload with all metadata
 
 ---
 
@@ -743,6 +765,7 @@ curl http://localhost:8001/  # Test from host
 3. **Learn operational procedures:** [docs/operations.md](docs/operations.md)
 4. **Review TODOs and improvements:** [docs/todos.md](docs/todos.md)
 5. **Reference terminology:** [docs/glossary.md](docs/glossary.md)
+6. **Ops Control Plane workflow:** [OPS.md](OPS.md) - Restart, redeploy, and rollback operations
 
 ---
 
