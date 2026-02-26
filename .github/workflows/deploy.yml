@@ -418,7 +418,7 @@ jobs:
             --name ${CONTAINER_NAME} \
             -p ${PORT}:8000 \
             -e ENVIRONMENT=${ENVIRONMENT} \
-            -e DEPLOYMENT_ID="${{ steps.build_metadata.outputs.deployment_id }}" \
+            -e DEPLOYMENT_ID="${{ github.run_id }}" \
             -e CONTAINER_NAME=${CONTAINER_NAME} \
             -e PORT=${PORT} \
             -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
