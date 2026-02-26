@@ -704,9 +704,70 @@ jobs:
             // Always use SHA format (never branch name like "main")
             // Priority: finalSha (target) > currentSha (running) > context.sha (workflow trigger)
             const ref = finalSha || currentSha || context.sha;
+            const shortSha = ref.substring(0, 7);
+
+            // Find which branch/PR this SHA belongs to (enables GitHub UI to show PR #)
+            let branchName = 'unknown';
+            let prNumber = null;
+
+            try {
+              // Strategy 1: Find associated PR (best source, gives both branch and PR #)
+              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: ref
+              });
+
+              if (prs.length > 0) {
+                prNumber = prs[0].number;
+                branchName = prs[0].head.ref;
+                core.info(`   SHA ${shortSha} from PR #${prNumber} (${branchName})`);
+              } else {
+                // Strategy 2: Check if SHA is HEAD of any branch
+                const { data: branches } = await github.rest.repos.listBranchesForHeadCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: ref
+                });
+
+                if (branches.length > 0) {
+                  const mainBranch = branches.find(b => b.name === 'main' || b.name === 'master');
+                  branchName = mainBranch ? mainBranch.name : branches[0].name;
+                  core.info(`   SHA ${shortSha} is HEAD of branch: ${branchName}`);
+                } else {
+                  // Strategy 3: Check existing deployment history
+                  core.info(`   SHA ${shortSha} not found as branch HEAD, checking deployment history...`);
+
+                  const { data: existingDeployments } = await github.rest.repos.listDeployments({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    sha: ref,
+                    per_page: 10
+                  });
+
+                  for (const dep of existingDeployments) {
+                    if (dep.payload?.pr_branch) {
+                      branchName = dep.payload.pr_branch;
+                      prNumber = dep.payload.pr_number ? Number(dep.payload.pr_number) : null;
+                      core.info(`   Found from previous deployment: ${branchName}${prNumber ? ` (PR #${prNumber})` : ''}`);
+                      break;
+                    }
+                  }
+
+                  if (branchName === 'unknown') {
+                    branchName = context.ref.replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '');
+                    core.info(`   Using workflow branch as fallback: ${branchName}`);
+                  }
+                }
+              }
+            } catch (error) {
+              core.warning(`Failed to lookup branch for ${shortSha}: ${error.message}`);
+              branchName = context.ref.replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '');
+            }
 
             core.info(`📝 Creating deployment record for ${environment} (${action})`);
             core.info(`   Ref: ${ref}`);
+            core.info(`   Branch: ${branchName}`);
             core.info(`   Action: ${action}`);
             core.info(`   Requester: ${requester}`);
 
@@ -714,12 +775,15 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               ref,
+              task: `${branchName}:${action}`,  // Shows branch + action in UI (e.g., "feature_1:restart")
               environment,
               auto_merge: false,
               required_contexts: [],  // Bypass status checks for ops deployments
-              description: `Ops ${action} to ${environment} by ${requester}`,
+              description: `Ops ${action} to ${environment} by ${requester} (${branchName}@${shortSha})`,
               payload: {
                 action,
+                pr_number: prNumber ? String(prNumber) : null,
+                pr_branch: branchName,
                 target_sha: finalSha || '',
                 current_image: currentImage || '',
                 triggered_by: requester,
@@ -737,7 +801,7 @@ jobs:
               deployment_id: deployment.id,
               state: 'in_progress',
               environment,
-              description: `Ops ${action} in progress for ${environment}`,
+              description: `Ops ${action} in progress for ${environment} (${branchName}@${shortSha})`,
               log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             });
 
@@ -1082,7 +1146,59 @@ jobs:
             const environment = '${{ steps.validate.outputs.environment }}';
             const action = '${{ steps.validate.outputs.action }}';
             const finalSha = '${{ steps.determine_sha.outputs.final_sha }}';
+            const currentSha = '${{ steps.determine_current.outputs.current_sha }}';
             const jobStatus = '${{ job.status }}';
+
+            // Find which branch/PR the deployment SHA belongs to
+            const deploymentSha = finalSha || currentSha || context.sha;
+            const shortSha = deploymentSha.substring(0, 7);
+
+            let branchName = 'unknown';
+            try {
+              // Try strategies: PR lookup -> branch HEAD -> deployment history
+              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: deploymentSha
+              });
+
+              if (prs.length > 0) {
+                branchName = prs[0].head.ref;
+              } else {
+                const { data: branches } = await github.rest.repos.listBranchesForHeadCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: deploymentSha
+                });
+
+                if (branches.length > 0) {
+                  const mainBranch = branches.find(b => b.name === 'main' || b.name === 'master');
+                  branchName = mainBranch ? mainBranch.name : branches[0].name;
+                } else {
+                  // Check deployment history
+                  const { data: existingDeployments } = await github.rest.repos.listDeployments({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    sha: deploymentSha,
+                    per_page: 10
+                  });
+
+                  for (const dep of existingDeployments) {
+                    if (dep.payload?.pr_branch) {
+                      branchName = dep.payload.pr_branch;
+                      break;
+                    }
+                  }
+
+                  if (branchName === 'unknown') {
+                    branchName = context.ref.replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '');
+                  }
+                }
+              }
+            } catch (error) {
+              core.warning(`Failed to lookup branch for ${shortSha}: ${error.message}`);
+              branchName = context.ref.replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '');
+            }
 
             // Sanitizer to remove 4-byte Unicode characters (emoji) that GitHub API rejects
             const sanitize = (s) => Array.from(s)
@@ -1094,11 +1210,10 @@ jobs:
 
             if (jobStatus === 'success') {
               state = 'success';
-              const shaDesc = finalSha ? `SHA ${finalSha.substring(0, 7)}` : 'current version';
-              description = `Ops ${action} completed for ${environment} (${shaDesc})`;
+              description = `Ops ${action} completed for ${environment} (${branchName}@${shortSha})`;
             } else if (jobStatus === 'failure') {
               state = 'failure';
-              description = `Ops ${action} failed for ${environment}`;
+              description = `Ops ${action} failed for ${environment} (${branchName}@${shortSha})`;
             } else {
               state = 'error';
               description = `Ops ${action} ended with status: ${jobStatus}`;
