@@ -363,6 +363,36 @@ const productionAuthorizedUsers = [
 
 ## Security Model
 
+### Threat Model Summary
+
+**Protected Assets:**
+- Production environment (localhost:8002, myapp-prod container)
+- Staging environment (localhost:8001, myapp-staging container)
+- Docker images (ci-demo:<SHA> tagged images)
+- Source code repository contents
+- Secrets (API_KEY, DB_HOST via GitHub Environment secrets)
+
+**Threat Actors:**
+1. **External attacker** (no repo access) - Threat: Social engineering, compromised accounts
+2. **Internal attacker** (can create PRs) - Threat: Hijack deployment via malicious PR comments
+3. **Compromised dependency** (supply chain) - Threat: Code injection during build
+4. **Insider threat** (authorized deployer) - Threat: Rogue deployment, data exfiltration
+
+### Security Controls
+
+**Workflow-Level Protections:**
+- Authorization allowlists per environment (staging vs production)
+- Strict command grammar validation
+- GitHub Deployments API audit trail
+- Least-privilege permissions (`contents:read`, cannot push code)
+- Default branch execution for issue_comment trigger
+
+**Deployment-Level Protections:**
+- SHA-based deployment (prevents hitchhiker commits)
+- Production approval gates via GitHub Environments
+- Staging-first enforcement (production reuses staging images)
+- Already-deployed detection (prevents redundant deployments)
+
 ### issue_comment Trigger (Default Branch Execution)
 
 **Why it matters:**
@@ -758,9 +788,66 @@ curl http://localhost:8001/  # Test from host
 
 ---
 
+## Operational Scenarios
+
+### Common Deployment Patterns
+
+**Standard Flow:**
+1. Create PR with feature changes
+2. Deploy to staging: Comment `[staging]` on PR
+3. Test staging environment thoroughly
+4. Deploy to production: Comment `[prod]` on PR
+5. Approve production deployment (if required)
+6. Verify production deployment
+
+**Emergency Rollback:**
+See [OPS.md](OPS.md) for rollback operations via Ops Console:
+- `[staging-rollback steps=1]` - Roll back staging by 1 deployment
+- `[prod-rollback steps=1 confirm=yes]` - Roll back production (requires confirmation)
+
+### Key Scenarios
+
+| Scenario | User Action | Expected Result |
+|----------|-------------|-----------------|
+| **Happy path staging** | Comment `[staging]` on open PR | Bot deploys to localhost:8001, posts success |
+| **Happy path production** | Comment `[prod]` on PR (after staging) | Approval required, then deploys to localhost:8002 |
+| **Already deployed** | Comment `[staging]` when SHA already running | Bot posts "Deployment Skipped" message |
+| **Authorization failure** | Unauthorized user comments `[prod]` | Bot posts "AUTHORIZATION FAILED" |
+| **Merge conflict** | Comment `[staging]` on PR with conflicts | Bot posts validation failure |
+| **Missing staging image** | Comment `[prod]` without staging first | Deployment fails with error message |
+
+### Production Incident Playbook
+
+**Fast Path for Critical Issues:**
+
+1. **Assess impact:** Confirm production issue requires immediate rollback
+2. **Navigate to Ops Console:** Go to designated ops issue (#2)
+3. **Post rollback command:**
+   ```
+   [prod-rollback steps=1 confirm=yes]
+   ```
+4. **Monitor execution:** Watch workflow in Actions tab
+5. **Approve if required:** Review deployments → Approve production
+6. **Verify rollback:** Check http://localhost:8002/ responds with previous version
+7. **Post-mortem:** Document incident, root cause, prevention
+
+**Rollback Options:**
+- **By steps:** `[prod-rollback steps=N confirm=yes]` - Roll back N deployments
+- **By SHA:** `[prod-redeploy sha=abc123... confirm=yes]` - Deploy specific version
+- **Restart current:** `[prod-restart]` - Restart current container (no version change)
+
+See [OPS.md](OPS.md) for complete ops workflow documentation.
+
+---
+
 ## Next Steps
 
-1. **Read detailed scenarios:** [docs/scenarios.md](docs/scenarios.md)
+1. **Ops Control Plane:** [OPS.md](OPS.md) - Restart, redeploy, and rollback operations
+2. **Operational runbook:** [docs/operations.md](docs/operations.md) - Daily procedures and troubleshooting
+3. **TODO backlog:** [docs/todos.md](docs/todos.md) - Planned improvements
+4. **Reference terminology:** [docs/glossary.md](docs/glossary.md) - Glossary of terms
+5. **Detailed scenarios (reference):** [docs/scenarios.md](docs/scenarios.md) - Comprehensive walkthroughs
+6. **Security details (reference):** [docs/security.md](docs/security.md) - Extended threat model
 2. **Understand security model:** [docs/security.md](docs/security.md)
 3. **Learn operational procedures:** [docs/operations.md](docs/operations.md)
 4. **Review TODOs and improvements:** [docs/todos.md](docs/todos.md)
