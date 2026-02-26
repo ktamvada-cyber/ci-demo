@@ -403,12 +403,14 @@ jobs:
               // Build array of successful deployment SHAs (deduplicate)
               const successfulShas = [];
               const seenShas = new Set();
+              let skippedNonShaRef = 0;
 
               for (const deployment of deployments) {
                 // Extract SHA from deployment ref first
                 const ref = deployment.ref;
                 // ref could be a SHA or a branch name; only process SHA format
                 if (!ref || !/^[a-f0-9]{40}$/.test(ref)) {
+                  skippedNonShaRef++;
                   continue;
                 }
 
@@ -425,13 +427,20 @@ jobs:
                   per_page: 10
                 });
 
-                // Check if most recent status is success
-                if (statuses.length > 0 && statuses[0].state === 'success') {
+                // Treat a deployment as "successful" if it EVER reached success.
+                // Many repos mark older successful deployments as "inactive" via auto_inactive:true.
+                const everSucceeded = statuses.some(s => s.state === 'success');
+
+                if (everSucceeded) {
                   successfulShas.push(ref);
                   seenShas.add(ref);
+                  core.info(`✅ Accepted deployment ${deployment.id}: latest=${statuses[0]?.state}, everSucceeded=true, ref=${ref.substring(0,7)}`);
+                } else {
+                  core.info(`⛔ Skipped deployment ${deployment.id}: latest=${statuses[0]?.state}, everSucceeded=false`);
                 }
               }
 
+              core.info(`ℹ️  Skipped ${skippedNonShaRef} deployments with non-SHA ref (e.g., ref=main)`);
               core.info(`Found ${successfulShas.length} successful deployments (deduplicated)`);
 
               if (successfulShas.length === 0) {
@@ -688,11 +697,13 @@ jobs:
             const environment = '${{ steps.validate.outputs.environment }}';
             const action = '${{ steps.validate.outputs.action }}';
             const finalSha = '${{ steps.determine_sha.outputs.final_sha }}';
+            const currentSha = '${{ steps.determine_current.outputs.current_sha }}';
             const requester = '${{ steps.validate.outputs.requester }}';
             const currentImage = '${{ steps.determine_current.outputs.current_image }}';
 
-            // Use SHA if available, otherwise use default branch
-            const ref = finalSha || context.ref;
+            // Always use SHA format (never branch name like "main")
+            // Priority: finalSha (target) > currentSha (running) > context.sha (workflow trigger)
+            const ref = finalSha || currentSha || context.sha;
 
             core.info(`📝 Creating deployment record for ${environment} (${action})`);
             core.info(`   Ref: ${ref}`);
