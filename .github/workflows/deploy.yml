@@ -19,6 +19,18 @@ permissions:
   issues: write         # Post deployment status comments
   deployments: write    # Create GitHub Deployments via API for correct ref tracking
 
+# Environment variables (workflow-level)
+env:
+  # Deployment configuration constants
+  STAGING_PORT: 8001
+  PROD_PORT: 8002
+  STAGING_CONTAINER: myapp-staging
+  PROD_CONTAINER: myapp-prod
+  IMAGE_NAME: ci-demo
+  CONTAINER_INTERNAL_PORT: 8000
+  HEALTH_CHECK_MAX_RETRIES: 10
+  HEALTH_CHECK_RETRY_SLEEP: 2
+
 # Concurrency control: Only ONE deployment at a time across all environments
 # Cancel any in-progress deployment when a new one is triggered
 # Prevents race conditions and ensures clean container state
@@ -291,7 +303,7 @@ jobs:
           if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
             # Get the image name/tag of the running container
             RUNNING_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME})
-            TARGET_IMAGE="ci-demo:${COMMIT_SHA}"
+            TARGET_IMAGE="${IMAGE_NAME}:${COMMIT_SHA}"
 
             if [ "$RUNNING_IMAGE" = "$TARGET_IMAGE" ]; then
               echo "already_deployed=true" >> $GITHUB_OUTPUT
@@ -320,8 +332,8 @@ jobs:
             const sha = '${{ steps.validate.outputs.pr_sha }}';
             const buildTimestamp = '${{ steps.build_metadata.outputs.build_timestamp }}';
             const deploymentId = '${{ steps.build_metadata.outputs.deployment_id }}';
-            const port = environment === 'staging' ? '8001' : '8002';
-            const containerName = environment === 'staging' ? 'myapp-staging' : 'myapp-prod';
+            const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
+            const containerName = environment === 'staging' ? process.env.STAGING_CONTAINER : process.env.PROD_CONTAINER;
 
             const comment = `### ℹ️ Deployment Skipped (Already Running)
 
@@ -392,21 +404,21 @@ jobs:
           #   DOCKER_BUILDKIT=1 docker build \
           #     --secret id=npm_token,env=NPM_TOKEN \
           #     --build-arg COMMIT_SHA=${COMMIT_SHA} \
-          #     -t ci-demo:${COMMIT_SHA} .
+          #     -t ${IMAGE_NAME}:${COMMIT_SHA} .
           # Then in Dockerfile: RUN --mount=type=secret,id=npm_token ...
           # This prevents secrets from leaking into image layers/history
-          echo "🔨 Building Docker image: ci-demo:${COMMIT_SHA}"
+          echo "🔨 Building Docker image: ${IMAGE_NAME}:${COMMIT_SHA}"
           docker build \
             --build-arg COMMIT_SHA=${COMMIT_SHA} \
             --build-arg BUILD_TIMESTAMP="${{ steps.build_metadata.outputs.build_timestamp }}" \
-            -t ci-demo:${COMMIT_SHA} \
+            -t ${IMAGE_NAME}:${COMMIT_SHA} \
             .
 
           # Capture Docker image digest (SHA256)
-          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ci-demo:${COMMIT_SHA} 2>/dev/null || echo "")
+          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_NAME}:${COMMIT_SHA} 2>/dev/null || echo "")
           if [ -z "$IMAGE_DIGEST" ]; then
             # If no RepoDigests (local image), get the image ID instead
-            IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ci-demo:${COMMIT_SHA})
+            IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${IMAGE_NAME}:${COMMIT_SHA})
           fi
           echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
           echo "🔐 Image Digest: ${IMAGE_DIGEST}"
@@ -425,7 +437,7 @@ jobs:
             -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
             -e API_KEY="${API_KEY}" \
             -e DB_HOST="${DB_HOST}" \
-            ci-demo:${COMMIT_SHA}
+            ${IMAGE_NAME}:${COMMIT_SHA}
 
           # Wait for container startup
           echo "⏳ Waiting for service to start..."
@@ -441,7 +453,7 @@ jobs:
 
           # Health check: Verify HTTP endpoint is responding
           echo "🏥 Checking service health..."
-          MAX_RETRIES=10
+          MAX_RETRIES=${HEALTH_CHECK_MAX_RETRIES}
           RETRY_COUNT=0
           HEALTH_STATUS="unknown"
 
@@ -453,7 +465,7 @@ jobs:
             fi
             RETRY_COUNT=$((RETRY_COUNT + 1))
             echo "⏳ Attempt $RETRY_COUNT/$MAX_RETRIES - waiting for service..."
-            sleep 2
+            sleep ${HEALTH_CHECK_RETRY_SLEEP}
           done
 
           if [ "$HEALTH_STATUS" != "healthy" ]; then
@@ -494,13 +506,13 @@ jobs:
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
         run: |
-          echo "🔍 Checking for staging image: ci-demo:${COMMIT_SHA}"
+          echo "🔍 Checking for staging image: ${IMAGE_NAME}:${COMMIT_SHA}"
 
           # Check if staging image exists
-          if ! docker image inspect ci-demo:${COMMIT_SHA} >/dev/null 2>&1; then
+          if ! docker image inspect ${IMAGE_NAME}:${COMMIT_SHA} >/dev/null 2>&1; then
             echo "❌ DEPLOYMENT FAILED"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "Staging image does not exist: ci-demo:${COMMIT_SHA}"
+            echo "Staging image does not exist: ${IMAGE_NAME}:${COMMIT_SHA}"
             echo ""
             echo "Production deployments MUST use the staging image."
             echo "You MUST deploy to staging first:"
@@ -512,7 +524,7 @@ jobs:
             exit 1
           fi
 
-          echo "✅ Staging image verified: ci-demo:${COMMIT_SHA}"
+          echo "✅ Staging image verified: ${IMAGE_NAME}:${COMMIT_SHA}"
 
       # STEP 9: Deploy to Production Environment
       # DOES NOT rebuild image - uses existing staging image
@@ -547,10 +559,10 @@ jobs:
           fi
 
           # Capture Docker image digest (SHA256) from staging image
-          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ci-demo:${COMMIT_SHA} 2>/dev/null || echo "")
+          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_NAME}:${COMMIT_SHA} 2>/dev/null || echo "")
           if [ -z "$IMAGE_DIGEST" ]; then
             # If no RepoDigests (local image), get the image ID instead
-            IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ci-demo:${COMMIT_SHA})
+            IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${IMAGE_NAME}:${COMMIT_SHA})
           fi
           echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
           echo "🔐 Image Digest: ${IMAGE_DIGEST}"
@@ -570,7 +582,7 @@ jobs:
             -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
             -e API_KEY="${API_KEY}" \
             -e DB_HOST="${DB_HOST}" \
-            ci-demo:${COMMIT_SHA}
+            ${IMAGE_NAME}:${COMMIT_SHA}
 
           # Wait for container startup
           echo "⏳ Waiting for service to start..."
@@ -586,7 +598,7 @@ jobs:
 
           # Health check: Verify HTTP endpoint is responding
           echo "🏥 Checking service health..."
-          MAX_RETRIES=10
+          MAX_RETRIES=${HEALTH_CHECK_MAX_RETRIES}
           RETRY_COUNT=0
           HEALTH_STATUS="unknown"
 
@@ -598,7 +610,7 @@ jobs:
             fi
             RETRY_COUNT=$((RETRY_COUNT + 1))
             echo "⏳ Attempt $RETRY_COUNT/$MAX_RETRIES - waiting for service..."
-            sleep 2
+            sleep ${HEALTH_CHECK_RETRY_SLEEP}
           done
 
           if [ "$HEALTH_STATUS" != "healthy" ]; then
@@ -631,8 +643,8 @@ jobs:
 
             const statusEmoji = jobStatus === 'success' ? '✅' : '❌';
             const statusText = jobStatus === 'success' ? 'SUCCEEDED' : 'FAILED';
-            const port = environment === 'staging' ? '8001' : '8002';
-            const containerName = environment === 'staging' ? 'myapp-staging' : 'myapp-prod';
+            const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
+            const containerName = environment === 'staging' ? process.env.STAGING_CONTAINER : process.env.PROD_CONTAINER;
 
             // Get environment-specific outputs
             const deployStep = environment === 'staging' ? 'deploy_staging' : 'deploy_production';
@@ -728,7 +740,7 @@ jobs:
             // Sanitize description to prevent 422 errors from emoji/4-byte chars
             description = sanitize(description);
 
-            const port = environment === 'staging' ? '8001' : '8002';
+            const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
             const environmentUrl = `http://localhost:${port}/`;
             const logUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
