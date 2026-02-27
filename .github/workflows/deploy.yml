@@ -279,33 +279,45 @@ jobs:
       # COVERAGE GATE: Block deployment if coverage check missing or failed
       # Queries GitHub Checks API for "test-coverage" check run (job name) on the PR SHA
       # Deployment proceeds only if coverage check exists with conclusion=success
+      - name: Query Coverage Check Data
+        id: query_coverage_check
+        if: steps.validate.outputs.should_deploy == 'true'
+        uses: ./.github/actions/query-coverage-check
+        with:
+          target-sha: ${{ steps.validate.outputs.pr_sha }}
+          required-check-name: 'test-coverage'
+
       - name: Verify Coverage Gate
         id: verify_coverage
-        if: steps.validate.outputs.should_deploy == 'true'
+        if: always() && steps.validate.outputs.should_deploy == 'true'
         uses: actions/github-script@v7
         with:
           script: |
+            // Propagate infrastructure failures from query step
+            if ('${{ steps.query_coverage_check.outcome }}' === 'failure') {
+              throw new Error('Coverage gate infrastructure failure');
+            }
+
             const prSha = '${{ steps.validate.outputs.pr_sha }}';
             const requiredCheckName = 'test-coverage';  // Must match job name in test-coverage.yml
 
             core.info(`🔍 Checking coverage gate for SHA: ${prSha}`);
 
-            // Query ALL check runs on this SHA (do not use check_name filter to avoid API quirks)
-            const { data: allChecks } = await github.rest.checks.listForRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: prSha
-            });
+            const totalChecks = '${{ steps.query_coverage_check.outputs.total_checks }}';
+            const matchingChecks = '${{ steps.query_coverage_check.outputs.matching_checks }}';
+            const checkFound = '${{ steps.query_coverage_check.outputs.check_found }}';
+            const checkStatus = '${{ steps.query_coverage_check.outputs.check_status }}';
+            const checkConclusion = '${{ steps.query_coverage_check.outputs.check_conclusion }}';
+            const checkUrl = '${{ steps.query_coverage_check.outputs.check_url }}';
+            const checkId = '${{ steps.query_coverage_check.outputs.check_id }}';
+            const coveragePct = '${{ steps.query_coverage_check.outputs.coverage_pct }}';
 
-            core.info(`Found ${allChecks.total_count} total check runs for SHA ${prSha.substring(0, 7)}`);
+            core.info(`Found ${totalChecks} total check runs for SHA ${prSha.substring(0, 7)}`);
 
-            // Filter to find the coverage check by exact name match
-            const coverageChecks = allChecks.check_runs.filter(check => check.name === requiredCheckName);
-
-            core.info(`Found ${coverageChecks.length} check runs with name="${requiredCheckName}"`);
+            core.info(`Found ${matchingChecks} check runs with name="${requiredCheckName}"`);
 
             // Verify coverage check exists
-            if (coverageChecks.length === 0) {
+            if (checkFound !== 'true') {
               const errorMsg = `❌ COVERAGE GATE FAILED: No "${requiredCheckName}" check found for SHA ${prSha.substring(0, 7)}.\n\nCoverage tests must run before deployment.`;
               core.setOutput('error_message', errorMsg);
               core.setOutput('target_sha', prSha);
@@ -313,52 +325,36 @@ jobs:
               return { passed: false };
             }
 
-            // Sort by completed_at (or started_at if not completed) descending to get most recent
-            const sortedChecks = coverageChecks.sort((a, b) => {
-              const timeA = new Date(a.completed_at || a.started_at || 0);
-              const timeB = new Date(b.completed_at || b.started_at || 0);
-              return timeB - timeA; // Newest first
-            });
-
-            // Get the most recent check run
-            const coverageCheck = sortedChecks[0];
-            core.info(`Using check run ID ${coverageCheck.id} (${coverageCheck.completed_at || coverageCheck.started_at})`);
-            core.info(`Check status: ${coverageCheck.status}, conclusion: ${coverageCheck.conclusion}`);
+            core.info(`Using check run ID ${checkId} (${checkStatus})`);
+            core.info(`Check status: ${checkStatus}, conclusion: ${checkConclusion}`);
 
             // Verify check is completed
-            if (coverageCheck.status !== 'completed') {
-              const statusMsg = coverageCheck.status === 'in_progress' ? 'still running' : coverageCheck.status;
-              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check is ${statusMsg}. Wait for coverage tests to complete.\n\nCheck: ${coverageCheck.html_url}`;
+            if (checkStatus !== 'completed') {
+              const statusMsg = checkStatus === 'in_progress' ? 'still running' : checkStatus;
+              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check is ${statusMsg}. Wait for coverage tests to complete.\n\nCheck: ${checkUrl}`;
               core.setOutput('error_message', errorMsg);
               core.setOutput('target_sha', prSha);
-              core.setOutput('check_url', coverageCheck.html_url);
+              core.setOutput('check_url', checkUrl);
               core.setFailed(errorMsg);
               return { passed: false };
             }
 
             // Verify check passed
-            if (coverageCheck.conclusion !== 'success') {
-              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check ${coverageCheck.conclusion}. Coverage must be ≥70% to deploy.\n\nCheck: ${coverageCheck.html_url}`;
+            if (checkConclusion !== 'success') {
+              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check ${checkConclusion}. Coverage must be ≥70% to deploy.\n\nCheck: ${checkUrl}`;
               core.setOutput('error_message', errorMsg);
               core.setOutput('target_sha', prSha);
-              core.setOutput('check_url', coverageCheck.html_url);
+              core.setOutput('check_url', checkUrl);
               core.setFailed(errorMsg);
               return { passed: false };
             }
 
-            // Extract coverage percentage from check run output (if available)
-            let coveragePct = 'N/A';
-            if (coverageCheck.output && coverageCheck.output.title) {
-              // Parse coverage from title like "✅ Coverage 74.0% (≥70%)"
-              const match = coverageCheck.output.title.match(/Coverage\s+([\d.]+)%/);
-              if (match) {
-                coveragePct = match[1];
-                core.info(`Extracted coverage: ${coveragePct}%`);
-              }
+            if (coveragePct !== 'N/A') {
+              core.info(`Extracted coverage: ${coveragePct}%`);
             }
 
             core.info(`✅ Coverage gate passed`);
-            core.setOutput('coverage_check_url', coverageCheck.html_url);
+            core.setOutput('coverage_check_url', checkUrl);
             core.setOutput('coverage_pct', coveragePct);
             core.setOutput('target_sha', prSha);
 
@@ -367,7 +363,8 @@ jobs:
       # STEP 1.7: Post coverage gate failure message
       # Runs if coverage gate check failed
       # Provides immediate feedback in PR about coverage requirements
-      - name: Post Coverage Gate Failure
+      - name: Construct Coverage Gate Failure Comment
+        id: coverage_failure_comment
         if: always() && steps.verify_coverage.outcome == 'failure'
         uses: actions/github-script@v7
         with:
@@ -411,18 +408,21 @@ jobs:
             📋 **View Deployment Workflow:** [Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
             `;
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: comment
-            });
+            core.setOutput('comment_body', comment);
+
+      - name: Post Coverage Gate Failure
+        if: always() && steps.verify_coverage.outcome == 'failure' && steps.coverage_failure_comment.outcome == 'success'
+        uses: ./.github/actions/post-comment
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-body: ${{ steps.coverage_failure_comment.outputs.comment_body }}
 
       # STEP 2: Post validation failure message
       # Runs if validation step completed but deployment was rejected
       # Provides immediate feedback in PR without checking Actions tab
       # Displays the EXACT error message from validation
-      - name: Post Validation Failure
+      - name: Construct Validation Failure Comment
+        id: validation_failure_comment
         if: always() && steps.validate.outcome == 'failure'
         uses: actions/github-script@v7
         with:
@@ -439,12 +439,14 @@ jobs:
             📋 **View Full Logs:** [Workflow Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
             `;
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: comment
-            });
+            core.setOutput('comment_body', comment);
+
+      - name: Post Validation Failure
+        if: always() && steps.validate.outcome == 'failure' && steps.validation_failure_comment.outcome == 'success'
+        uses: ./.github/actions/post-comment
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-body: ${{ steps.validation_failure_comment.outputs.comment_body }}
 
       # STEP 3: Checkout exact commit SHA from PR HEAD
       # SECURITY: Always checkout by exact SHA, NEVER by branch name
@@ -511,7 +513,8 @@ jobs:
 
       # STEP 6: Post already-deployed notification
       # Informs user that deployment was skipped because same version is running
-      - name: Post Already Deployed Status
+      - name: Construct Already Deployed Status Comment
+        id: already_deployed_status_comment
         if: steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed == 'true'
         uses: actions/github-script@v7
         with:
@@ -546,12 +549,14 @@ jobs:
             💡 **Note:** No deployment needed - skipping to avoid unnecessary downtime.
             `;
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: comment
-            });
+            core.setOutput('comment_body', comment);
+
+      - name: Post Already Deployed Status
+        if: steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed == 'true' && steps.already_deployed_status_comment.outcome == 'success'
+        uses: ./.github/actions/post-comment
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-body: ${{ steps.already_deployed_status_comment.outputs.comment_body }}
 
       # STEP 7: Deploy to Staging Environment
       # Builds new Docker image tagged with commit SHA
@@ -817,7 +822,8 @@ jobs:
 
       # STEP 10: Post deployment status comment to PR
       # Runs always (success or failure) if validation passed and deployment was attempted
-      - name: Post Deployment Status
+      - name: Construct Deployment Status Comment
+        id: deployment_status_comment
         if: always() && steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed != 'true'
         uses: actions/github-script@v7
         with:
@@ -882,12 +888,14 @@ jobs:
               comment += `**Workflow Run:** [View Logs](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n`;
             }
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: comment
-            });
+            core.setOutput('comment_body', comment);
+
+      - name: Post Deployment Status
+        if: always() && steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed != 'true' && steps.deployment_status_comment.outcome == 'success'
+        uses: ./.github/actions/post-comment
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-body: ${{ steps.deployment_status_comment.outputs.comment_body }}
 
       # STEP 11: Update GitHub Deployment Status
       # Updates the deployment record created in step 1.5 with final status

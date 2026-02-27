@@ -1,0 +1,102 @@
+name: Query Coverage Check
+description: Queries GitHub Checks API for coverage check data on a specific SHA
+inputs:
+  target-sha:
+    description: 'The commit SHA to query'
+    required: true
+  required-check-name:
+    description: 'Name of the required coverage check run'
+    required: true
+  github-token:
+    description: 'GitHub token for API access'
+    required: false
+    default: ${{ github.token }}
+outputs:
+  check_found:
+    description: 'Boolean string: "true" if check found, "false" otherwise'
+    value: ${{ steps.query.outputs.check_found }}
+  check_status:
+    description: 'Check status (completed, in_progress, etc.) or empty if not found'
+    value: ${{ steps.query.outputs.check_status }}
+  check_conclusion:
+    description: 'Check conclusion (success, failure, etc.) or empty if not found'
+    value: ${{ steps.query.outputs.check_conclusion }}
+  check_url:
+    description: 'HTML URL to check run or empty if not found'
+    value: ${{ steps.query.outputs.check_url }}
+  check_id:
+    description: 'Check run ID or empty if not found'
+    value: ${{ steps.query.outputs.check_id }}
+  coverage_pct:
+    description: 'Extracted coverage percentage or "N/A"'
+    value: ${{ steps.query.outputs.coverage_pct }}
+  total_checks:
+    description: 'Total number of check runs found for SHA'
+    value: ${{ steps.query.outputs.total_checks }}
+  matching_checks:
+    description: 'Number of check runs matching the required name'
+    value: ${{ steps.query.outputs.matching_checks }}
+runs:
+  using: composite
+  steps:
+    - name: Query coverage check data
+      id: query
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const targetSha = '${{ inputs.target-sha }}';
+          const requiredCheckName = '${{ inputs.required-check-name }}';
+
+          // Query ALL check runs on this SHA (do not use check_name filter to avoid API quirks)
+          const { data: allChecks } = await github.rest.checks.listForRef({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: targetSha
+          });
+
+          // Filter to find the coverage check by exact name match
+          const coverageChecks = allChecks.check_runs.filter(check => check.name === requiredCheckName);
+
+          // Set basic counts
+          core.setOutput('total_checks', allChecks.total_count);
+          core.setOutput('matching_checks', coverageChecks.length);
+
+          // If no matching checks found, return early
+          if (coverageChecks.length === 0) {
+            core.setOutput('check_found', 'false');
+            core.setOutput('check_status', '');
+            core.setOutput('check_conclusion', '');
+            core.setOutput('check_url', '');
+            core.setOutput('check_id', '');
+            core.setOutput('coverage_pct', 'N/A');
+            return;
+          }
+
+          // Sort by completed_at (or started_at if not completed) descending to get most recent
+          const sortedChecks = coverageChecks.sort((a, b) => {
+            const timeA = new Date(a.completed_at || a.started_at || 0);
+            const timeB = new Date(b.completed_at || b.started_at || 0);
+            return timeB - timeA; // Newest first
+          });
+
+          // Get the most recent check run
+          const coverageCheck = sortedChecks[0];
+
+          // Extract coverage percentage from check run output (if available)
+          let coveragePct = 'N/A';
+          if (coverageCheck.output && coverageCheck.output.title) {
+            // Parse coverage from title like "✅ Coverage 74.0% (≥70%)"
+            const match = coverageCheck.output.title.match(/Coverage\s+([\d.]+)%/);
+            if (match) {
+              coveragePct = match[1];
+            }
+          }
+
+          // Return all check data
+          core.setOutput('check_found', 'true');
+          core.setOutput('check_status', coverageCheck.status || '');
+          core.setOutput('check_conclusion', coverageCheck.conclusion || '');
+          core.setOutput('check_url', coverageCheck.html_url || '');
+          core.setOutput('check_id', coverageCheck.id.toString());
+          core.setOutput('coverage_pct', coveragePct);

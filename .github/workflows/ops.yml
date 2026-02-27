@@ -310,7 +310,8 @@ jobs:
 
       # STEP 2: Post validation failure message
       # Runs if validation step completed but operation was rejected
-      - name: Post Validation Failure
+      - name: Construct Validation Failure Comment
+        id: validation_failure_comment
         if: always() && steps.validate.outputs.should_run == 'false' && steps.validate.outputs.error_message != ''
         uses: actions/github-script@v7
         with:
@@ -333,12 +334,15 @@ jobs:
             // For issue_comment, post to the same issue (which should be ops console)
             const targetIssue = isWorkflowDispatch ? opsIssueNumber : context.issue.number;
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: targetIssue,
-              body: comment
-            });
+            core.setOutput('comment_body', comment);
+            core.setOutput('target_issue', targetIssue);
+
+      - name: Post Validation Failure
+        if: always() && steps.validate.outputs.should_run == 'false' && steps.validate.outputs.error_message != '' && steps.validation_failure_comment.outcome == 'success'
+        uses: ./.github/actions/post-comment
+        with:
+          issue-number: ${{ steps.validation_failure_comment.outputs.target_issue }}
+          comment-body: ${{ steps.validation_failure_comment.outputs.comment_body }}
 
       # STEP 2.5: Resolve Ref/Tag to SHA
       # If target_sha is provided, resolve it to a 40-char commit SHA
@@ -474,7 +478,8 @@ jobs:
 
       # STEP 2.6: Post ref resolution failure message
       # Runs if ref resolution failed
-      - name: Post Ref Resolution Failure
+      - name: Construct Ref Resolution Failure Comment
+        id: ref_resolution_failure_comment
         if: always() && steps.resolve_sha.outcome == 'failure'
         uses: actions/github-script@v7
         with:
@@ -513,12 +518,15 @@ jobs:
             // For issue_comment, post to the same issue (which should be ops console)
             const targetIssue = isWorkflowDispatch ? opsIssueNumber : context.issue.number;
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: targetIssue,
-              body: comment
-            });
+            core.setOutput('comment_body', comment);
+            core.setOutput('target_issue', targetIssue);
+
+      - name: Post Ref Resolution Failure
+        if: always() && steps.resolve_sha.outcome == 'failure' && steps.ref_resolution_failure_comment.outcome == 'success'
+        uses: ./.github/actions/post-comment
+        with:
+          issue-number: ${{ steps.ref_resolution_failure_comment.outputs.target_issue }}
+          comment-body: ${{ steps.ref_resolution_failure_comment.outputs.comment_body }}
 
       # STEP 3: Determine current SHA from running container
       # Extract current SHA and image reference for rollback calculations
@@ -900,15 +908,32 @@ jobs:
       # COVERAGE GATE: Block redeploy/rollback if coverage check missing or failed
       # Queries GitHub Checks API for "test-coverage" check run (job name) on the target SHA
       # Skips for restart operations (no new code deployment)
+      - name: Query Coverage Check Data
+        id: query_coverage_check
+        if: |
+          steps.validate.outputs.should_run == 'true' &&
+          (steps.validate.outputs.action == 'redeploy' || steps.validate.outputs.action == 'rollback') &&
+          steps.determine_sha.outputs.final_sha != ''
+        uses: ./.github/actions/query-coverage-check
+        with:
+          target-sha: ${{ steps.determine_sha.outputs.final_sha }}
+          required-check-name: 'test-coverage'
+
       - name: Verify Coverage Gate
         id: verify_coverage
         if: |
+          always() &&
           steps.validate.outputs.should_run == 'true' &&
           (steps.validate.outputs.action == 'redeploy' || steps.validate.outputs.action == 'rollback') &&
           steps.determine_sha.outputs.final_sha != ''
         uses: actions/github-script@v7
         with:
           script: |
+            // Propagate infrastructure failures from query step
+            if ('${{ steps.query_coverage_check.outcome }}' === 'failure') {
+              throw new Error('Coverage gate infrastructure failure');
+            }
+
             const targetSha = '${{ steps.determine_sha.outputs.final_sha }}';
             const action = '${{ steps.validate.outputs.action }}';
             const originalRef = '${{ steps.resolve_sha.outputs.original_ref }}';
@@ -921,22 +946,21 @@ jobs:
               core.info(`🔍 Checking coverage gate for ${action} to SHA: ${targetSha}`);
             }
 
-            // Query ALL check runs on this SHA (do not use check_name filter to avoid API quirks)
-            const { data: allChecks } = await github.rest.checks.listForRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: targetSha
-            });
+            const totalChecks = '${{ steps.query_coverage_check.outputs.total_checks }}';
+            const matchingChecks = '${{ steps.query_coverage_check.outputs.matching_checks }}';
+            const checkFound = '${{ steps.query_coverage_check.outputs.check_found }}';
+            const checkStatus = '${{ steps.query_coverage_check.outputs.check_status }}';
+            const checkConclusion = '${{ steps.query_coverage_check.outputs.check_conclusion }}';
+            const checkUrl = '${{ steps.query_coverage_check.outputs.check_url }}';
+            const checkId = '${{ steps.query_coverage_check.outputs.check_id }}';
+            const coveragePct = '${{ steps.query_coverage_check.outputs.coverage_pct }}';
 
-            core.info(`Found ${allChecks.total_count} total check runs for SHA ${targetSha.substring(0, 7)}`);
+            core.info(`Found ${totalChecks} total check runs for SHA ${targetSha.substring(0, 7)}`);
 
-            // Filter to find the coverage check by exact name match
-            const coverageChecks = allChecks.check_runs.filter(check => check.name === requiredCheckName);
-
-            core.info(`Found ${coverageChecks.length} check runs with name="${requiredCheckName}"`);
+            core.info(`Found ${matchingChecks} check runs with name="${requiredCheckName}"`);
 
             // Verify coverage check exists
-            if (coverageChecks.length === 0) {
+            if (checkFound !== 'true') {
               const errorMsg = `❌ COVERAGE GATE FAILED: No "${requiredCheckName}" check found for SHA ${targetSha.substring(0, 7)}.\n\nCoverage tests must run before ${action}.`;
               core.setOutput('error_message', errorMsg);
               core.setOutput('target_sha', targetSha);
@@ -944,52 +968,36 @@ jobs:
               return { passed: false };
             }
 
-            // Sort by completed_at (or started_at if not completed) descending to get most recent
-            const sortedChecks = coverageChecks.sort((a, b) => {
-              const timeA = new Date(a.completed_at || a.started_at || 0);
-              const timeB = new Date(b.completed_at || b.started_at || 0);
-              return timeB - timeA; // Newest first
-            });
-
-            // Get the most recent check run
-            const coverageCheck = sortedChecks[0];
-            core.info(`Using check run ID ${coverageCheck.id} (${coverageCheck.completed_at || coverageCheck.started_at})`);
-            core.info(`Check status: ${coverageCheck.status}, conclusion: ${coverageCheck.conclusion}`);
+            core.info(`Using check run ID ${checkId} (${checkStatus})`);
+            core.info(`Check status: ${checkStatus}, conclusion: ${checkConclusion}`);
 
             // Verify check is completed
-            if (coverageCheck.status !== 'completed') {
-              const statusMsg = coverageCheck.status === 'in_progress' ? 'still running' : coverageCheck.status;
-              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check is ${statusMsg}. Wait for coverage tests to complete.\n\nCheck: ${coverageCheck.html_url}`;
+            if (checkStatus !== 'completed') {
+              const statusMsg = checkStatus === 'in_progress' ? 'still running' : checkStatus;
+              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check is ${statusMsg}. Wait for coverage tests to complete.\n\nCheck: ${checkUrl}`;
               core.setOutput('error_message', errorMsg);
               core.setOutput('target_sha', targetSha);
-              core.setOutput('check_url', coverageCheck.html_url);
+              core.setOutput('check_url', checkUrl);
               core.setFailed(errorMsg);
               return { passed: false };
             }
 
             // Verify check passed
-            if (coverageCheck.conclusion !== 'success') {
-              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check ${coverageCheck.conclusion}. Coverage must be ≥70% for ${action}.\n\nCheck: ${coverageCheck.html_url}`;
+            if (checkConclusion !== 'success') {
+              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check ${checkConclusion}. Coverage must be ≥70% for ${action}.\n\nCheck: ${checkUrl}`;
               core.setOutput('error_message', errorMsg);
               core.setOutput('target_sha', targetSha);
-              core.setOutput('check_url', coverageCheck.html_url);
+              core.setOutput('check_url', checkUrl);
               core.setFailed(errorMsg);
               return { passed: false };
             }
 
-            // Extract coverage percentage from check run output (if available)
-            let coveragePct = 'N/A';
-            if (coverageCheck.output && coverageCheck.output.title) {
-              // Parse coverage from title like "✅ Coverage 74.0% (≥70%)"
-              const match = coverageCheck.output.title.match(/Coverage\s+([\d.]+)%/);
-              if (match) {
-                coveragePct = match[1];
-                core.info(`Extracted coverage: ${coveragePct}%`);
-              }
+            if (coveragePct !== 'N/A') {
+              core.info(`Extracted coverage: ${coveragePct}%`);
             }
 
             core.info(`✅ Coverage gate passed`);
-            core.setOutput('coverage_check_url', coverageCheck.html_url);
+            core.setOutput('coverage_check_url', checkUrl);
             core.setOutput('coverage_pct', coveragePct);
             core.setOutput('target_sha', targetSha);
 
@@ -998,7 +1006,8 @@ jobs:
       # STEP 5.6: Post coverage gate failure message
       # Runs if coverage gate check failed for redeploy/rollback
       # Provides immediate feedback to Ops Console about coverage requirements
-      - name: Post Coverage Gate Failure
+      - name: Construct Coverage Gate Failure Comment
+        id: coverage_gate_failure_comment
         if: always() && steps.verify_coverage.outcome == 'failure'
         uses: actions/github-script@v7
         with:
@@ -1049,12 +1058,15 @@ jobs:
             // For issue_comment, post to the same issue (which should be ops console)
             const targetIssue = isWorkflowDispatch ? opsIssueNumber : context.issue.number;
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: targetIssue,
-              body: comment
-            });
+            core.setOutput('comment_body', comment);
+            core.setOutput('target_issue', targetIssue);
+
+      - name: Post Coverage Gate Failure
+        if: always() && steps.verify_coverage.outcome == 'failure' && steps.coverage_gate_failure_comment.outcome == 'success'
+        uses: ./.github/actions/post-comment
+        with:
+          issue-number: ${{ steps.coverage_gate_failure_comment.outputs.target_issue }}
+          comment-body: ${{ steps.coverage_gate_failure_comment.outputs.comment_body }}
 
       # STEP 6: Create GitHub Deployment record
       # Creates a deployment tied to the target SHA for tracking
@@ -1424,7 +1436,8 @@ jobs:
 
       # STEP 8: Post ops status comment
       # Posts result to Ops Console issue
-      - name: Post Ops Status Comment
+      - name: Construct Ops Status Comment
+        id: ops_status_comment
         if: always() && steps.validate.outputs.should_run == 'true'
         uses: actions/github-script@v7
         with:
@@ -1503,12 +1516,15 @@ jobs:
             // Post to ops console issue
             const targetIssue = isWorkflowDispatch ? opsIssueNumber : context.issue.number;
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: targetIssue,
-              body: comment
-            });
+            core.setOutput('comment_body', comment);
+            core.setOutput('target_issue', targetIssue);
+
+      - name: Post Ops Status Comment
+        if: always() && steps.validate.outputs.should_run == 'true' && steps.ops_status_comment.outcome == 'success'
+        uses: ./.github/actions/post-comment
+        with:
+          issue-number: ${{ steps.ops_status_comment.outputs.target_issue }}
+          comment-body: ${{ steps.ops_status_comment.outputs.comment_body }}
 
       # STEP 9: Update GitHub Deployment Status
       # Updates the deployment record with final status
