@@ -1,0 +1,199 @@
+name: CI Architecture Guard Rails
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/deploy.yml'
+      - '.github/workflows/ops.yml'
+      - '.github/actions/post-comment/**'
+      - '.github/actions/query-coverage-check/**'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/deploy.yml'
+      - '.github/workflows/ops.yml'
+      - '.github/actions/post-comment/**'
+      - '.github/actions/query-coverage-check/**'
+
+jobs:
+  verify-architecture-invariants:
+    name: Verify CI Architecture Invariants
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Invariant 1 - verify_coverage step exists
+        run: |
+          echo "🔍 Checking: verify_coverage step exists in deploy.yml and ops.yml"
+
+          if ! grep -q "id: verify_coverage" .github/workflows/deploy.yml; then
+            echo "❌ FAILURE: verify_coverage step missing in deploy.yml"
+            exit 1
+          fi
+
+          if ! grep -q "id: verify_coverage" .github/workflows/ops.yml; then
+            echo "❌ FAILURE: verify_coverage step missing in ops.yml"
+            exit 1
+          fi
+
+          echo "✅ PASS: verify_coverage step exists in both workflows"
+
+      - name: Check Invariant 2 - verify_coverage uses always()
+        run: |
+          echo "🔍 Checking: verify_coverage step uses always() in condition"
+
+          # Check deploy.yml has always() in if condition after verify_coverage id
+          if ! grep -A2 "id: verify_coverage" .github/workflows/deploy.yml | grep -q "if:.*always()"; then
+            echo "❌ FAILURE: verify_coverage in deploy.yml missing always() in if condition"
+            exit 1
+          fi
+
+          # Check ops.yml has always() in if condition after verify_coverage id
+          if ! grep -A5 "id: verify_coverage" .github/workflows/ops.yml | grep -q "always()"; then
+            echo "❌ FAILURE: verify_coverage in ops.yml missing always() in if condition"
+            exit 1
+          fi
+
+          echo "✅ PASS: verify_coverage uses always() in both workflows"
+
+      - name: Check Invariant 3 - Infrastructure failure propagation exists
+        run: |
+          echo "🔍 Checking: Infrastructure failure propagation check exists"
+
+          if ! grep -q "steps.query_coverage_check.outcome" .github/workflows/deploy.yml; then
+            echo "❌ FAILURE: Infrastructure propagation missing in deploy.yml"
+            exit 1
+          fi
+
+          if ! grep -q "steps.query_coverage_check.outcome" .github/workflows/ops.yml; then
+            echo "❌ FAILURE: Infrastructure propagation missing in ops.yml"
+            exit 1
+          fi
+
+          echo "✅ PASS: Infrastructure failure propagation exists in both workflows"
+
+      - name: Check Invariant 4 - Downstream failure steps reference verify_coverage
+        run: |
+          echo "🔍 Checking: Downstream failure comment steps reference verify_coverage.outcome"
+
+          if ! grep -q "steps.verify_coverage.outcome == 'failure'" .github/workflows/deploy.yml; then
+            echo "❌ FAILURE: Downstream failure check missing in deploy.yml"
+            exit 1
+          fi
+
+          if ! grep -q "steps.verify_coverage.outcome == 'failure'" .github/workflows/ops.yml; then
+            echo "❌ FAILURE: Downstream failure check missing in ops.yml"
+            exit 1
+          fi
+
+          echo "✅ PASS: Downstream failure comment steps properly reference verify_coverage"
+
+      - name: Check Invariant 5 - Coverage threshold wording exact
+        run: |
+          echo "🔍 Checking: Coverage threshold wording preserved exactly"
+
+          if ! grep -q "Coverage must be ≥70% to deploy" .github/workflows/deploy.yml; then
+            echo "❌ FAILURE: deploy.yml threshold wording changed"
+            echo "Expected: 'Coverage must be ≥70% to deploy'"
+            exit 1
+          fi
+
+          if ! grep -q 'Coverage must be ≥70% for ${action}' .github/workflows/ops.yml; then
+            echo "❌ FAILURE: ops.yml threshold wording changed"
+            echo "Expected: 'Coverage must be ≥70% for \${action}'"
+            exit 1
+          fi
+
+          echo "✅ PASS: Coverage threshold wording preserved exactly"
+
+      - name: Check Invariant 6 - Coverage extraction regex exact
+        run: |
+          echo "🔍 Checking: Coverage extraction regex preserved exactly"
+
+          if ! grep -Fq "/Coverage\s+([\d.]+)%/" .github/actions/query-coverage-check/action.yml; then
+            echo "❌ FAILURE: Coverage extraction regex changed in query-coverage-check"
+            echo "Expected pattern: match(/Coverage\\s+([\\d.]+)%/)"
+            exit 1
+          fi
+
+          echo "✅ PASS: Coverage extraction regex preserved exactly"
+
+      - name: Check Invariant 7 - No inline comment creation
+        run: |
+          echo "🔍 Checking: No inline github.rest.issues.createComment calls"
+
+          if grep -q "github.rest.issues.createComment" .github/workflows/deploy.yml; then
+            echo "❌ FAILURE: Inline createComment found in deploy.yml"
+            echo "All comment posting must use ./.github/actions/post-comment"
+            exit 1
+          fi
+
+          if grep -q "github.rest.issues.createComment" .github/workflows/ops.yml; then
+            echo "❌ FAILURE: Inline createComment found in ops.yml"
+            echo "All comment posting must use ./.github/actions/post-comment"
+            exit 1
+          fi
+
+          echo "✅ PASS: No inline comment creation detected"
+
+      - name: Check Invariant 8 - All comment posting uses composite action
+        run: |
+          echo "🔍 Checking: All comment posting uses post-comment action"
+
+          # Count post-comment usages to ensure composite action is being used
+          DEPLOY_COUNT=$(grep -c "uses: ./.github/actions/post-comment" .github/workflows/deploy.yml || true)
+          OPS_COUNT=$(grep -c "uses: ./.github/actions/post-comment" .github/workflows/ops.yml || true)
+
+          if [ "$DEPLOY_COUNT" -lt 1 ]; then
+            echo "❌ FAILURE: Expected at least 1 post-comment usage in deploy.yml, found $DEPLOY_COUNT"
+            exit 1
+          fi
+
+          if [ "$OPS_COUNT" -lt 1 ]; then
+            echo "❌ FAILURE: Expected at least 1 post-comment usage in ops.yml, found $OPS_COUNT"
+            exit 1
+          fi
+
+          echo "✅ PASS: All comment posting uses post-comment action (deploy: $DEPLOY_COUNT, ops: $OPS_COUNT)"
+
+      - name: Check Invariant 9 - query-coverage-check is pure data fetcher
+        run: |
+          echo "🔍 Checking: query-coverage-check remains pure data fetch boundary"
+
+          if grep -q "core.setFailed" .github/actions/query-coverage-check/action.yml; then
+            echo "❌ FAILURE: query-coverage-check contains core.setFailed (not pure)"
+            echo "This action must remain a pure data fetcher with no failure logic"
+            exit 1
+          fi
+
+          if grep -q "COVERAGE GATE FAILED" .github/actions/query-coverage-check/action.yml; then
+            echo "❌ FAILURE: query-coverage-check contains error message construction (not pure)"
+            echo "Error messages must remain in workflows, not in the query action"
+            exit 1
+          fi
+
+          if grep -q "Checking coverage gate for" .github/actions/query-coverage-check/action.yml; then
+            echo "❌ FAILURE: query-coverage-check contains contextual logging (not pure)"
+            echo "Contextual logging must remain in workflows, not in the query action"
+            exit 1
+          fi
+
+          echo "✅ PASS: query-coverage-check is pure data fetch boundary"
+
+      - name: All Invariants Satisfied
+        run: |
+          echo ""
+          echo "════════════════════════════════════════════════════════"
+          echo "✅ All CI architecture invariants satisfied"
+          echo "════════════════════════════════════════════════════════"
+          echo ""
+          echo "Protected architecture:"
+          echo "  - Phase 1: Centralized comment posting"
+          echo "  - Phase 2: Centralized status comments"
+          echo "  - Phase 3: Coverage gate query boundary"
+          echo "  - Phase 3 Fix: Failure propagation equivalence"
+          echo ""
+          echo "All guard rails passed. CI architecture is protected."
