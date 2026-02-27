@@ -87,7 +87,7 @@ runs:
           let coveragePct = 'N/A';
           if (coverageCheck.output && coverageCheck.output.title) {
             // Parse coverage from title like "✅ Coverage 74.0% (≥70%)"
-            const match = coverageCheck.output.title.match(/Coverage\s+([\d.]+)%/);
+            const match = coverageCheck.output.title.match(/Coverage\s+([\d.]+) percent/);
             if (match) {
               coveragePct = match[1];
             }
