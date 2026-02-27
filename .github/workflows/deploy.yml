@@ -152,29 +152,22 @@ jobs:
                     }
                   }
 
-                  coverageErrorMsg = `❌ DEPLOYMENT BLOCKED: Coverage Gate Failed
-
-**Coverage:** ${coveragePct}% (threshold: 70%)
-**Status:** Test coverage check failed
-
----
-
-#### 📊 Coverage Requirements
-
-Deployments require:
-- ✅ Coverage must be ≥70%
-- ✅ All tests must pass
-- ✅ Check "test-coverage" must complete with success
-
-#### 🔧 How to Fix
-
-1. Add tests to increase coverage to ≥70%
-2. Ensure all existing tests pass
-3. Push changes to trigger new coverage check
-4. Wait for "test-coverage" check to pass
-5. Retry deployment
-
-**Check run:** ${coverageCheck.html_url}`;
+                  coverageErrorMsg = `❌ DEPLOYMENT BLOCKED: Coverage Gate Failed\n\n` +
+                    `**Coverage:** ${coveragePct}% (threshold: 70%)\n` +
+                    `**Status:** Test coverage check failed\n\n` +
+                    `---\n\n` +
+                    `#### 📊 Coverage Requirements\n\n` +
+                    `Deployments require:\n` +
+                    `- ✅ Coverage must be ≥70%\n` +
+                    `- ✅ All tests must pass\n` +
+                    `- ✅ Check "test-coverage" must complete with success\n\n` +
+                    `#### 🔧 How to Fix\n\n` +
+                    `1. Add tests to increase coverage to ≥70%\n` +
+                    `2. Ensure all existing tests pass\n` +
+                    `3. Push changes to trigger new coverage check\n` +
+                    `4. Wait for "test-coverage" check to pass\n` +
+                    `5. Retry deployment\n\n` +
+                    `**Check run:** ${coverageCheck.html_url}`;
                 }
               } catch (error) {
                 core.info(`Could not check coverage status: ${error.message}`);
