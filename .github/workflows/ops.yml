@@ -320,9 +320,11 @@ jobs:
         id: validation_failure_comment
         if: always() && steps.validate.outputs.should_run == 'false' && steps.validate.outputs.error_message != ''
         uses: actions/github-script@v7
+        env:
+          ERROR_MESSAGE_JSON: ${{ toJson(steps.validate.outputs.error_message) }}
         with:
           script: |
-            const errorMessage = '${{ steps.validate.outputs.error_message }}';
+            const errorMessage = JSON.parse(process.env.ERROR_MESSAGE_JSON);
             const opsIssueNumber = Number(process.env.OPS_ISSUE_NUMBER);
             const isWorkflowDispatch = context.eventName === 'workflow_dispatch';
 
