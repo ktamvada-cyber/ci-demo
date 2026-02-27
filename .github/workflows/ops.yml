@@ -94,6 +94,12 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # STEP 0: Checkout repository
+      # Required for composite actions (.github/actions/post-comment, query-coverage-check)
+      # Must run unconditionally since error paths also use composite actions
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       # STEP 1: Validate and parse ops trigger
       # Detects trigger source (workflow_dispatch vs issue_comment)
       # Parses and validates inputs strictly
