@@ -1,0 +1,22 @@
+# CI Architecture Ownership
+#
+# This file defines code ownership for CI/CD infrastructure.
+# Changes to these paths require review from designated owners.
+#
+# Documentation: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# GitHub Actions Workflows
+# All workflow files require owner approval to prevent unauthorized CI modifications
+.github/workflows/* @ktamvada-cyber
+
+# Composite Actions
+# Reusable action components that are critical to CI architecture
+.github/actions/* @ktamvada-cyber
+
+# CI Documentation
+# Architecture and governance documentation
+.github/docs/refactor-snapshot-v1.md @ktamvada-cyber
+
+# CODEOWNERS File
+# Changes to code ownership require owner approval
+.github/CODEOWNERS @ktamvada-cyber
