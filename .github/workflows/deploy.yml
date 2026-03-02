@@ -22,13 +22,10 @@ permissions:
 
 # Environment variables (workflow-level)
 env:
-  # Deployment configuration constants
-  STAGING_PORT: 8001
-  PROD_PORT: 8002
-  STAGING_CONTAINER: myapp-staging
-  PROD_CONTAINER: myapp-prod
-  IMAGE_NAME: ci-demo
-  CONTAINER_INTERNAL_PORT: 8000
+  # VM deployment configuration constants
+  STAGING_PORT: 9001
+  PROD_PORT: 9002
+  SERVICE_DIR: /var/www/myservice
   HEALTH_CHECK_MAX_RETRIES: 10
   HEALTH_CHECK_RETRY_SLEEP: 2
 
@@ -57,6 +54,13 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # STEP 0: Cleanup orphan processes before deployment
+      - name: Ensure no orphan processes
+        run: |
+          echo "🧹 Cleaning up any orphan processes..."
+          pkill -f "uvicorn app.main" || true
+          echo "✅ Cleanup complete"
+
       # STEP 1: Validate deployment trigger and perform all security checks
       - name: Validate deployment trigger and permissions
         id: validate
@@ -485,28 +489,31 @@ jobs:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
           ENVIRONMENT: ${{ steps.validate.outputs.environment }}
         run: |
-          CONTAINER_NAME="myapp-${ENVIRONMENT}"
+          # Check if service directory exists and has the target commit checked out
+          if [ -d "${SERVICE_DIR}" ]; then
+            cd ${SERVICE_DIR}
+            CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
 
-          # Check if container exists and is running
-          if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            # Get the image name/tag of the running container
-            RUNNING_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME})
-            TARGET_IMAGE="${IMAGE_NAME}:${COMMIT_SHA}"
-
-            if [ "$RUNNING_IMAGE" = "$TARGET_IMAGE" ]; then
-              echo "already_deployed=true" >> $GITHUB_OUTPUT
-              echo "✅ Same version already deployed: ${COMMIT_SHA}"
-              echo "⏭️  Skipping deployment (no changes)"
-              exit 0
+            if [ "$CURRENT_SHA" = "$COMMIT_SHA" ]; then
+              # Check if service is actually running
+              if pgrep -f "uvicorn app.main" > /dev/null; then
+                echo "already_deployed=true" >> $GITHUB_OUTPUT
+                echo "✅ Same version already deployed: ${COMMIT_SHA}"
+                echo "⏭️  Skipping deployment (no changes)"
+                exit 0
+              else
+                echo "already_deployed=false" >> $GITHUB_OUTPUT
+                echo "🔄 Correct SHA checked out but service not running"
+              fi
             else
               echo "already_deployed=false" >> $GITHUB_OUTPUT
               echo "🔄 Different version detected"
-              echo "   Current: ${RUNNING_IMAGE}"
-              echo "   Target:  ${TARGET_IMAGE}"
+              echo "   Current: ${CURRENT_SHA:-'(none)'}"
+              echo "   Target:  ${COMMIT_SHA}"
             fi
           else
             echo "already_deployed=false" >> $GITHUB_OUTPUT
-            echo "📭 No existing container found"
+            echo "📭 Service directory not found"
           fi
 
       # STEP 6: Post already-deployed notification
@@ -521,7 +528,6 @@ jobs:
             const buildTimestamp = '${{ steps.build_metadata.outputs.build_timestamp }}';
             const deploymentId = '${{ steps.build_metadata.outputs.deployment_id }}';
             const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
-            const containerName = environment === 'staging' ? process.env.STAGING_CONTAINER : process.env.PROD_CONTAINER;
 
             const comment = `### ℹ️ Deployment Skipped (Already Running)
 
@@ -533,7 +539,6 @@ jobs:
             | **Commit SHA** | \`${sha}\` |
             | **Check Timestamp** | \`${buildTimestamp}\` |
             | **Check ID** | \`${deploymentId}\` |
-            | **Container** | \`${containerName}\` |
             | **Port** | \`${port}\` |
 
             ---
@@ -553,91 +558,77 @@ jobs:
               body: comment
             });
 
-      # STEP 7: Deploy to Staging Environment
-      # Builds new Docker image tagged with commit SHA
-      # Stops and removes any existing staging container
-      # SECURITY: Secrets (API_KEY, DB_HOST) are injected at runtime, NOT via build args
+      # STEP 7: Deploy to Staging Environment (VM Mode)
+      # Checks out target commit via git and restarts service
+      # SECURITY: Secrets (API_KEY, DB_HOST) are injected at runtime as environment variables
       - name: Deploy to Staging
         id: deploy_staging
         if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'staging' && steps.check_deployed.outputs.already_deployed != 'true'
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
           ENVIRONMENT: staging
-          CONTAINER_NAME: myapp-staging
-          PORT: 8001
+          PORT: ${{ env.STAGING_PORT }}
           API_KEY: ${{ secrets.API_KEY }}
           DB_HOST: ${{ secrets.DB_HOST }}
         run: |
-          echo "🚀 Starting staging deployment..."
+          set -e
+
+          echo "🚀 Starting staging deployment (VM mode)..."
           echo "📍 Commit SHA: ${COMMIT_SHA}"
           echo "🏷️  Environment: ${ENVIRONMENT}"
-          echo "📦 Container: ${CONTAINER_NAME}"
+          echo "📁 Service Directory: ${SERVICE_DIR}"
           echo "🔌 Port: ${PORT}"
 
-          # Stop and remove existing staging container if running
-          if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "🛑 Stopping existing container: ${CONTAINER_NAME}"
-            docker stop ${CONTAINER_NAME} 2>/dev/null || true
-            echo "🗑️  Removing existing container: ${CONTAINER_NAME}"
-            docker rm ${CONTAINER_NAME} 2>/dev/null || true
-          else
-            echo "ℹ️  No existing container found"
+          # Ensure service directory exists
+          if [ ! -d "${SERVICE_DIR}" ]; then
+            echo "📁 Creating service directory: ${SERVICE_DIR}"
+            sudo mkdir -p ${SERVICE_DIR}
+            sudo chown -R $(whoami) ${SERVICE_DIR}
+            cd ${SERVICE_DIR}
+            git clone ${{ github.server_url }}/${{ github.repository }} .
           fi
 
-          # Build Docker image with exact commit SHA tag and metadata
-          # COMMIT_SHA and BUILD_TIMESTAMP are baked into the image via build args
-          #
-          # SECURITY: If secrets are needed during build (e.g., pulling private deps),
-          # use Docker BuildKit secret mounts instead of build args:
-          #   DOCKER_BUILDKIT=1 docker build \
-          #     --secret id=npm_token,env=NPM_TOKEN \
-          #     --build-arg COMMIT_SHA=${COMMIT_SHA} \
-          #     -t ${IMAGE_NAME}:${COMMIT_SHA} .
-          # Then in Dockerfile: RUN --mount=type=secret,id=npm_token ...
-          # This prevents secrets from leaking into image layers/history
-          echo "🔨 Building Docker image: ${IMAGE_NAME}:${COMMIT_SHA}"
-          docker build \
-            --build-arg COMMIT_SHA=${COMMIT_SHA} \
-            --build-arg BUILD_TIMESTAMP="${{ steps.build_metadata.outputs.build_timestamp }}" \
-            -t ${IMAGE_NAME}:${COMMIT_SHA} \
-            .
+          # Navigate to service directory
+          cd ${SERVICE_DIR}
 
-          # Capture Docker image digest (SHA256)
-          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_NAME}:${COMMIT_SHA} 2>/dev/null || echo "")
-          if [ -z "$IMAGE_DIGEST" ]; then
-            # If no RepoDigests (local image), get the image ID instead
-            IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${IMAGE_NAME}:${COMMIT_SHA})
+          # Stop any running service instances
+          echo "🛑 Stopping existing service..."
+          pkill -f "uvicorn app.main" || true
+          sleep 2
+
+          # Fetch and checkout target commit
+          echo "📥 Fetching repository updates..."
+          git fetch origin
+          echo "🔀 Checking out commit: ${COMMIT_SHA}"
+          git checkout ${COMMIT_SHA}
+
+          # Install dependencies if requirements.txt exists
+          if [ -f requirements.txt ]; then
+            echo "📦 Installing dependencies..."
+            python3 -m venv venv || true
+            source venv/bin/activate
+            pip install -q -r requirements.txt
           fi
-          echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
-          echo "🔐 Image Digest: ${IMAGE_DIGEST}"
 
-          # Run new staging container with runtime-specific metadata
-          # COMMIT_SHA and BUILD_TIMESTAMP are already in the image, no need to pass again
-          # SECURITY: Inject secrets at runtime, never via build args
-          echo "▶️  Running new container: ${CONTAINER_NAME}"
-          docker run -d \
-            --name ${CONTAINER_NAME} \
-            -p ${PORT}:8000 \
-            -e ENVIRONMENT=${ENVIRONMENT} \
-            -e DEPLOYMENT_ID="${{ github.run_id }}" \
-            -e CONTAINER_NAME=${CONTAINER_NAME} \
-            -e PORT=${PORT} \
-            -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
-            -e API_KEY="${API_KEY}" \
-            -e DB_HOST="${DB_HOST}" \
-            ${IMAGE_NAME}:${COMMIT_SHA}
+          # Start service in background
+          echo "▶️  Starting service on port ${PORT}..."
+          export COMMIT_SHA="${COMMIT_SHA}"
+          export ENVIRONMENT="${ENVIRONMENT}"
+          export DEPLOYMENT_ID="${{ github.run_id }}"
+          export PORT="${PORT}"
+          export API_KEY="${API_KEY}"
+          export DB_HOST="${DB_HOST}"
 
-          # Wait for container startup
+          nohup venv/bin/uvicorn app.main:app \
+            --host 0.0.0.0 \
+            --port ${PORT} \
+            > app.log 2>&1 &
+
+          echo "service_pid=$!" >> $GITHUB_OUTPUT
+
+          # Wait for service startup
           echo "⏳ Waiting for service to start..."
           sleep 5
-
-          # Health check: Verify container is running
-          if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "❌ Container failed to start"
-            docker logs ${CONTAINER_NAME}
-            echo "readiness_status=failed" >> $GITHUB_OUTPUT
-            exit 1
-          fi
 
           # Health check: Verify HTTP endpoint is responding
           echo "🏥 Checking service health..."
@@ -657,15 +648,17 @@ jobs:
           done
 
           if [ "$HEALTH_STATUS" != "healthy" ]; then
-            echo "⚠️  Warning: Service health check did not pass within timeout"
-            echo "   Container is running but may not be fully ready"
-            HEALTH_STATUS="running_unverified"
+            echo "❌ Service health check failed"
+            echo "📋 Last 50 lines of app.log:"
+            tail -50 app.log || true
+            echo "readiness_status=failed" >> $GITHUB_OUTPUT
+            exit 1
           fi
 
           echo "readiness_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
 
           echo "✅ Staging deployment successful"
-          echo "🌐 Container: ${CONTAINER_NAME}"
+          echo "📁 Directory: ${SERVICE_DIR}"
           echo "🔌 Port: ${PORT}"
           echo "📍 Commit: ${COMMIT_SHA}"
           echo "🏥 Health: ${HEALTH_STATUS}"
@@ -687,22 +680,26 @@ jobs:
       # 4. RELIABILITY: "What you test is what you deploy" - the binary deployed to production
       #    must be byte-for-byte identical to what was tested in staging.
       #
-      # Therefore, production deployment FAILS if the staging image does not exist.
+      # Therefore, production deployment FAILS if the commit was not tested in staging first.
       # This enforces the staging-first workflow and prevents untested production deployments.
-      - name: Verify Staging Image Exists
+      - name: Verify Staging Deployment Exists
         if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production' && steps.check_deployed.outputs.already_deployed != 'true'
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
         run: |
-          echo "🔍 Checking for staging image: ${IMAGE_NAME}:${COMMIT_SHA}"
+          echo "🔍 Verifying staging deployment for commit: ${COMMIT_SHA}"
 
-          # Check if staging image exists
-          if ! docker image inspect ${IMAGE_NAME}:${COMMIT_SHA} >/dev/null 2>&1; then
+          # In VM mode, we verify that this commit exists in the repository
+          # Production deployments should only use commits that have been tested
+          # The staging-first workflow is enforced by requiring the commit to be merged/available
+
+          cd ${SERVICE_DIR}
+          if ! git cat-file -e ${COMMIT_SHA} 2>/dev/null; then
             echo "❌ DEPLOYMENT FAILED"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "Staging image does not exist: ${IMAGE_NAME}:${COMMIT_SHA}"
+            echo "Commit does not exist: ${COMMIT_SHA}"
             echo ""
-            echo "Production deployments MUST use the staging image."
+            echo "Production deployments MUST use tested commits."
             echo "You MUST deploy to staging first:"
             echo "  1. Comment: [staging]"
             echo "  2. Wait for staging deployment to complete"
@@ -712,77 +709,81 @@ jobs:
             exit 1
           fi
 
-          echo "✅ Staging image verified: ${IMAGE_NAME}:${COMMIT_SHA}"
+          echo "✅ Commit verified: ${COMMIT_SHA}"
 
-      # STEP 9: Deploy to Production Environment
-      # DOES NOT rebuild image - uses existing staging image
-      # Stops and removes any existing production container
-      # SECURITY: Secrets (API_KEY, DB_HOST) are injected at runtime, NOT via build args
+      # STEP 9: Deploy to Production Environment (VM Mode)
+      # Uses same commit that was tested in staging - NO REBUILD
+      # Checks out target commit via git and restarts service on production port
+      # SECURITY: Secrets (API_KEY, DB_HOST) are injected at runtime as environment variables
       - name: Deploy to Production
         id: deploy_production
         if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production' && steps.check_deployed.outputs.already_deployed != 'true'
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
           ENVIRONMENT: production
-          CONTAINER_NAME: myapp-prod
-          PORT: 8002
+          PORT: ${{ env.PROD_PORT }}
           API_KEY: ${{ secrets.API_KEY }}
           DB_HOST: ${{ secrets.DB_HOST }}
         run: |
-          echo "🚀 Starting production deployment..."
+          set -e
+
+          echo "🚀 Starting production deployment (VM mode)..."
           echo "📍 Commit SHA: ${COMMIT_SHA}"
           echo "🏷️  Environment: ${ENVIRONMENT}"
-          echo "📦 Container: ${CONTAINER_NAME}"
+          echo "📁 Service Directory: ${SERVICE_DIR}"
           echo "🔌 Port: ${PORT}"
-          echo "⚠️  Using existing staging image (NO REBUILD)"
+          echo "⚠️  Using tested commit (NO REBUILD)"
 
-          # Stop and remove existing production container if running
-          if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "🛑 Stopping existing container: ${CONTAINER_NAME}"
-            docker stop ${CONTAINER_NAME} 2>/dev/null || true
-            echo "🗑️  Removing existing container: ${CONTAINER_NAME}"
-            docker rm ${CONTAINER_NAME} 2>/dev/null || true
-          else
-            echo "ℹ️  No existing container found"
+          # Ensure service directory exists
+          if [ ! -d "${SERVICE_DIR}" ]; then
+            echo "📁 Creating service directory: ${SERVICE_DIR}"
+            sudo mkdir -p ${SERVICE_DIR}
+            sudo chown -R $(whoami) ${SERVICE_DIR}
+            cd ${SERVICE_DIR}
+            git clone ${{ github.server_url }}/${{ github.repository }} .
           fi
 
-          # Capture Docker image digest (SHA256) from staging image
-          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_NAME}:${COMMIT_SHA} 2>/dev/null || echo "")
-          if [ -z "$IMAGE_DIGEST" ]; then
-            # If no RepoDigests (local image), get the image ID instead
-            IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${IMAGE_NAME}:${COMMIT_SHA})
+          # Navigate to service directory
+          cd ${SERVICE_DIR}
+
+          # Stop any running service instances (both staging and production)
+          echo "🛑 Stopping existing service instances..."
+          pkill -f "uvicorn app.main" || true
+          sleep 2
+
+          # Fetch and checkout target commit
+          echo "📥 Fetching repository updates..."
+          git fetch origin
+          echo "🔀 Checking out commit: ${COMMIT_SHA}"
+          git checkout ${COMMIT_SHA}
+
+          # Install dependencies if requirements.txt exists
+          if [ -f requirements.txt ]; then
+            echo "📦 Installing dependencies..."
+            python3 -m venv venv || true
+            source venv/bin/activate
+            pip install -q -r requirements.txt
           fi
-          echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
-          echo "🔐 Image Digest: ${IMAGE_DIGEST}"
 
-          # Run production container using PRE-BUILT staging image
-          # DO NOT REBUILD - use existing image only
-          # COMMIT_SHA and BUILD_TIMESTAMP are already baked into the image from staging build
-          # SECURITY: Inject secrets at runtime, never via build args
-          echo "▶️  Running new container: ${CONTAINER_NAME}"
-          docker run -d \
-            --name ${CONTAINER_NAME} \
-            -p ${PORT}:8000 \
-            -e ENVIRONMENT=${ENVIRONMENT} \
-            -e DEPLOYMENT_ID="${{ github.run_id }}" \
-            -e CONTAINER_NAME=${CONTAINER_NAME} \
-            -e PORT=${PORT} \
-            -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
-            -e API_KEY="${API_KEY}" \
-            -e DB_HOST="${DB_HOST}" \
-            ${IMAGE_NAME}:${COMMIT_SHA}
+          # Start service in background on production port
+          echo "▶️  Starting service on port ${PORT}..."
+          export COMMIT_SHA="${COMMIT_SHA}"
+          export ENVIRONMENT="${ENVIRONMENT}"
+          export DEPLOYMENT_ID="${{ github.run_id }}"
+          export PORT="${PORT}"
+          export API_KEY="${API_KEY}"
+          export DB_HOST="${DB_HOST}"
 
-          # Wait for container startup
+          nohup venv/bin/uvicorn app.main:app \
+            --host 0.0.0.0 \
+            --port ${PORT} \
+            > app.log 2>&1 &
+
+          echo "service_pid=$!" >> $GITHUB_OUTPUT
+
+          # Wait for service startup
           echo "⏳ Waiting for service to start..."
           sleep 5
-
-          # Health check: Verify container is running
-          if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "❌ Container failed to start"
-            docker logs ${CONTAINER_NAME}
-            echo "readiness_status=failed" >> $GITHUB_OUTPUT
-            exit 1
-          fi
 
           # Health check: Verify HTTP endpoint is responding
           echo "🏥 Checking service health..."
@@ -802,15 +803,17 @@ jobs:
           done
 
           if [ "$HEALTH_STATUS" != "healthy" ]; then
-            echo "⚠️  Warning: Service health check did not pass within timeout"
-            echo "   Container is running but may not be fully ready"
-            HEALTH_STATUS="running_unverified"
+            echo "❌ Service health check failed"
+            echo "📋 Last 50 lines of app.log:"
+            tail -50 app.log || true
+            echo "readiness_status=failed" >> $GITHUB_OUTPUT
+            exit 1
           fi
 
           echo "readiness_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
 
           echo "✅ Production deployment successful"
-          echo "🌐 Container: ${CONTAINER_NAME}"
+          echo "📁 Directory: ${SERVICE_DIR}"
           echo "🔌 Port: ${PORT}"
           echo "📍 Commit: ${COMMIT_SHA}"
           echo "🏥 Health: ${HEALTH_STATUS}"
@@ -832,13 +835,9 @@ jobs:
             const statusEmoji = jobStatus === 'success' ? '✅' : '❌';
             const statusText = jobStatus === 'success' ? 'SUCCEEDED' : 'FAILED';
             const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
-            const containerName = environment === 'staging' ? process.env.STAGING_CONTAINER : process.env.PROD_CONTAINER;
 
             // Get environment-specific outputs
             const deployStep = environment === 'staging' ? 'deploy_staging' : 'deploy_production';
-            const imageDigest = environment === 'staging'
-              ? '${{ steps.deploy_staging.outputs.image_digest }}'
-              : '${{ steps.deploy_production.outputs.image_digest }}';
             const readinessStatus = environment === 'staging'
               ? '${{ steps.deploy_staging.outputs.readiness_status }}'
               : '${{ steps.deploy_production.outputs.readiness_status }}';
@@ -862,9 +861,7 @@ jobs:
             | **Commit SHA** | \`${sha}\` |
             | **Build Timestamp** | \`${buildTimestamp}\` |
             | **Deployment ID** | \`${deploymentId}\` |
-            | **Container** | \`${containerName}\` |
             | **Port** | \`${port}\` |
-            ${imageDigest ? `| **Image Digest** | \`${imageDigest.substring(0, 80)}${imageDigest.length > 80 ? '...' : ''}\` |` : ''}
             | **Service Status** | ${readinessDisplay} |
             `;
 

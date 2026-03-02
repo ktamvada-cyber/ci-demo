@@ -53,13 +53,10 @@ env:
   # TODO: Create a pinned "Ops Console" issue and set the number here
   OPS_ISSUE_NUMBER: 2
 
-  # Deployment configuration constants
-  STAGING_PORT: 8001
-  PROD_PORT: 8002
-  STAGING_CONTAINER: myapp-staging
-  PROD_CONTAINER: myapp-prod
-  IMAGE_NAME: ci-demo
-  CONTAINER_INTERNAL_PORT: 8000
+  # VM deployment configuration constants
+  STAGING_PORT: 9001
+  PROD_PORT: 9002
+  SERVICE_DIR: /var/www/myservice
   HEALTH_CHECK_MAX_RETRIES: 10
   HEALTH_CHECK_RETRY_SLEEP: 2
 
@@ -88,12 +85,19 @@ jobs:
     # Strict matching: [prod-restart], [prod-redeploy...], [prod-rollback...]
     environment:
       name: ${{ github.event.inputs.environment || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')) && 'production' || 'staging') }}
-      url: ${{ (github.event.inputs.environment == 'production' || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')))) && 'http://localhost:8002' || 'http://localhost:8001' }}
+      url: ${{ (github.event.inputs.environment == 'production' || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')))) && 'http://localhost:9002' || 'http://localhost:9001' }}
 
     # Prevent runaway operations - fail if job exceeds 15 minutes
     timeout-minutes: 15
 
     steps:
+      # STEP 0: Cleanup orphan processes before ops operation
+      - name: Ensure no orphan processes
+        run: |
+          echo "🧹 Cleaning up any orphan processes..."
+          pkill -f "uvicorn app.main" || true
+          echo "✅ Cleanup complete"
+
       # STEP 1: Validate and parse ops trigger
       # Detects trigger source (workflow_dispatch vs issue_comment)
       # Parses and validates inputs strictly
@@ -282,8 +286,7 @@ jobs:
               core.info(`✅ Rollback target validated`);
             }
 
-            // Determine container and port from workflow env constants
-            const containerName = environment === 'staging' ? process.env.STAGING_CONTAINER : process.env.PROD_CONTAINER;
+            // Determine port from workflow env constants
             const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
 
             // Set outputs
@@ -293,7 +296,6 @@ jobs:
             core.setOutput('target_sha', targetSha);
             core.setOutput('steps', steps);
             core.setOutput('confirm', confirm);
-            core.setOutput('container_name', containerName);
             core.setOutput('port', port);
             core.setOutput('requester', requester);
             core.setOutput('skip_tagging', 'true');  // Ops workflow never tags
@@ -304,7 +306,6 @@ jobs:
               shouldRun: true,
               action,
               environment,
-              containerName,
               port
             };
 
@@ -520,38 +521,31 @@ jobs:
               body: comment
             });
 
-      # STEP 3: Determine current SHA from running container
-      # Extract current SHA and image reference for rollback calculations
+      # STEP 3: Determine current SHA from service directory
+      # Extract current SHA from git repository for rollback calculations
       - name: Determine Current SHA
         id: determine_current
         if: steps.validate.outputs.should_run == 'true'
-        env:
-          CONTAINER_NAME: ${{ steps.validate.outputs.container_name }}
         run: |
           echo "🔍 Determining current state..."
 
           CURRENT_SHA=""
-          CURRENT_IMAGE=""
 
-          # Try to get current SHA from running container
-          if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            CURRENT_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME} 2>/dev/null || echo "")
-            echo "📦 Current image: ${CURRENT_IMAGE}"
-
-            # Extract SHA from image tag (${IMAGE_NAME}:<sha>)
-            if [[ "$CURRENT_IMAGE" =~ ${IMAGE_NAME}:([a-f0-9]{40}) ]]; then
-              CURRENT_SHA="${BASH_REMATCH[1]}"
+          # Try to get current SHA from service directory
+          if [ -d "${SERVICE_DIR}" ]; then
+            cd ${SERVICE_DIR}
+            CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+            if [ -n "$CURRENT_SHA" ]; then
               echo "📍 Current SHA: ${CURRENT_SHA}"
             else
-              echo "⚠️  Could not extract SHA from current image tag"
+              echo "⚠️  Could not determine current SHA from git repository"
             fi
           else
-            echo "ℹ️  No container currently running"
+            echo "ℹ️  Service directory does not exist"
           fi
 
           # Output results
           echo "current_sha=${CURRENT_SHA}" >> $GITHUB_OUTPUT
-          echo "current_image=${CURRENT_IMAGE}" >> $GITHUB_OUTPUT
 
       # STEP 4: Compute Rollback Target (GitHub Deployments API)
       # PRIMARY source of truth for rollback-by-steps
@@ -1180,7 +1174,7 @@ jobs:
               log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             });
 
-      # STEP 7: Execute ops operation
+      # STEP 7: Execute ops operation (VM Mode)
       # Performs restart, redeploy, or rollback based on action
       - name: Execute Ops Operation
         id: execute_ops
@@ -1188,20 +1182,29 @@ jobs:
         env:
           ACTION: ${{ steps.validate.outputs.action }}
           ENVIRONMENT: ${{ steps.validate.outputs.environment }}
-          CONTAINER_NAME: ${{ steps.validate.outputs.container_name }}
           PORT: ${{ steps.validate.outputs.port }}
           FINAL_SHA: ${{ steps.determine_sha.outputs.final_sha }}
-          FINAL_IMAGE_REF: ${{ steps.determine_sha.outputs.final_image_ref }}
           API_KEY: ${{ secrets.API_KEY }}
           DB_HOST: ${{ secrets.DB_HOST }}
         run: |
+          set -e
+
           echo "🚀 Executing ops operation: ${ACTION} on ${ENVIRONMENT}"
-          echo "📦 Container: ${CONTAINER_NAME}"
+          echo "📁 Service Directory: ${SERVICE_DIR}"
           echo "🔌 Port: ${PORT}"
 
           HEALTH_STATUS="unknown"
-          IMAGE_DIGEST=""
-          ACTUAL_IMAGE=""
+
+          # Ensure service directory exists
+          if [ ! -d "${SERVICE_DIR}" ]; then
+            echo "📁 Creating service directory: ${SERVICE_DIR}"
+            sudo mkdir -p ${SERVICE_DIR}
+            sudo chown -R $(whoami) ${SERVICE_DIR}
+            cd ${SERVICE_DIR}
+            git clone ${{ github.server_url }}/${{ github.repository }} .
+          fi
+
+          cd ${SERVICE_DIR}
 
           # ============================================================
           # RESTART OPERATION
@@ -1209,26 +1212,46 @@ jobs:
           if [ "$ACTION" = "restart" ]; then
             echo "♻️  Performing restart operation..."
 
-            # Check if container exists
-            if ! docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "❌ ERROR: Container ${CONTAINER_NAME} does not exist"
-              exit 1
+            # Check if service is running
+            if ! pgrep -f "uvicorn app.main" > /dev/null; then
+              echo "⚠️  WARNING: Service is not running. Will start it instead."
+            else
+              echo "🛑 Stopping service..."
+              pkill -f "uvicorn app.main" || true
+              sleep 2
             fi
 
-            # Restart container
-            echo "🔄 Restarting container: ${CONTAINER_NAME}"
-            docker restart ${CONTAINER_NAME}
+            # Get current SHA
+            CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+            echo "📍 Current SHA: ${CURRENT_SHA}"
+
+            # Install dependencies if needed
+            if [ -f requirements.txt ]; then
+              echo "📦 Checking dependencies..."
+              python3 -m venv venv || true
+              source venv/bin/activate
+              pip install -q -r requirements.txt
+            fi
+
+            # Start service
+            echo "▶️  Starting service on port ${PORT}..."
+            export COMMIT_SHA="${CURRENT_SHA}"
+            export ENVIRONMENT="${ENVIRONMENT}"
+            export DEPLOYMENT_ID="${{ github.run_id }}"
+            export PORT="${PORT}"
+            export API_KEY="${API_KEY}"
+            export DB_HOST="${DB_HOST}"
+
+            nohup venv/bin/uvicorn app.main:app \
+              --host 0.0.0.0 \
+              --port ${PORT} \
+              > app.log 2>&1 &
+
+            echo "service_pid=$!" >> $GITHUB_OUTPUT
 
             # Wait for startup
             echo "⏳ Waiting for service to start..."
             sleep 5
-
-            # Get actual image and digest
-            ACTUAL_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME} 2>/dev/null || echo "")
-            IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${CONTAINER_NAME} 2>/dev/null || echo "")
-            if [ -z "$IMAGE_DIGEST" ]; then
-              IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${CONTAINER_NAME})
-            fi
 
           # ============================================================
           # REDEPLOY OPERATION
@@ -1236,60 +1259,47 @@ jobs:
           elif [ "$ACTION" = "redeploy" ]; then
             echo "🔄 Performing redeploy operation..."
 
-            # Determine image to redeploy
-            if [ -n "$FINAL_IMAGE_REF" ]; then
-              TARGET_IMAGE="$FINAL_IMAGE_REF"
-            elif [ -n "$FINAL_SHA" ]; then
-              TARGET_IMAGE="${IMAGE_NAME}:${FINAL_SHA}"
-            else
-              echo "❌ ERROR: Cannot redeploy without target image or SHA"
+            if [ -z "$FINAL_SHA" ]; then
+              echo "❌ ERROR: Cannot redeploy without target SHA"
               exit 1
             fi
 
-            echo "🎯 Target image: ${TARGET_IMAGE}"
+            echo "🎯 Target SHA: ${FINAL_SHA}"
 
-            # Verify image exists
-            if ! docker image inspect ${TARGET_IMAGE} >/dev/null 2>&1; then
-              echo "❌ ERROR: Image does not exist: ${TARGET_IMAGE}"
-              echo ""
-              echo "Demo limitation: Image must be built locally first."
-              if [ -n "$FINAL_SHA" ]; then
-                echo "To build this image, deploy SHA ${FINAL_SHA} to staging first:"
-                echo "  Comment: [staging] on the PR for this SHA"
-              fi
-              exit 1
+            # Stop existing service
+            echo "🛑 Stopping existing service..."
+            pkill -f "uvicorn app.main" || true
+            sleep 2
+
+            # Fetch and checkout target commit
+            echo "📥 Fetching repository updates..."
+            git fetch origin
+            echo "🔀 Checking out commit: ${FINAL_SHA}"
+            git checkout ${FINAL_SHA}
+
+            # Install dependencies
+            if [ -f requirements.txt ]; then
+              echo "📦 Installing dependencies..."
+              python3 -m venv venv || true
+              source venv/bin/activate
+              pip install -q -r requirements.txt
             fi
 
-            # Stop and remove existing container
-            if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "🛑 Stopping existing container: ${CONTAINER_NAME}"
-              docker stop ${CONTAINER_NAME} 2>/dev/null || true
-              echo "🗑️  Removing existing container: ${CONTAINER_NAME}"
-              docker rm ${CONTAINER_NAME} 2>/dev/null || true
-            fi
+            # Start service
+            echo "▶️  Starting service on port ${PORT}..."
+            export COMMIT_SHA="${FINAL_SHA}"
+            export ENVIRONMENT="${ENVIRONMENT}"
+            export DEPLOYMENT_ID="${{ github.run_id }}"
+            export PORT="${PORT}"
+            export API_KEY="${API_KEY}"
+            export DB_HOST="${DB_HOST}"
 
-            # Get image digest before deployment
-            IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${TARGET_IMAGE} 2>/dev/null || echo "")
-            if [ -z "$IMAGE_DIGEST" ]; then
-              IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${TARGET_IMAGE})
-            fi
-            echo "🔐 Image Digest: ${IMAGE_DIGEST}"
+            nohup venv/bin/uvicorn app.main:app \
+              --host 0.0.0.0 \
+              --port ${PORT} \
+              > app.log 2>&1 &
 
-            # Run new container with runtime env injection
-            echo "▶️  Running new container: ${CONTAINER_NAME}"
-            docker run -d \
-              --name ${CONTAINER_NAME} \
-              -p ${PORT}:8000 \
-              -e ENVIRONMENT=${ENVIRONMENT} \
-              -e DEPLOYMENT_ID="${{ github.run_id }}" \
-              -e CONTAINER_NAME=${CONTAINER_NAME} \
-              -e PORT=${PORT} \
-              -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
-              -e API_KEY="${API_KEY}" \
-              -e DB_HOST="${DB_HOST}" \
-              ${TARGET_IMAGE}
-
-            ACTUAL_IMAGE="${TARGET_IMAGE}"
+            echo "service_pid=$!" >> $GITHUB_OUTPUT
 
             # Wait for startup
             echo "⏳ Waiting for service to start..."
@@ -1306,53 +1316,52 @@ jobs:
               exit 1
             fi
 
-            TARGET_IMAGE="${IMAGE_NAME}:${FINAL_SHA}"
-            echo "🎯 Rollback target: ${TARGET_IMAGE}"
+            echo "🎯 Rollback target SHA: ${FINAL_SHA}"
 
-            # Verify image exists locally
-            if ! docker image inspect ${TARGET_IMAGE} >/dev/null 2>&1; then
-              echo "❌ ERROR: Rollback image does not exist locally: ${TARGET_IMAGE}"
-              echo ""
-              echo "Demo limitation: Image must be built locally first."
-              echo "To build this image, deploy SHA ${FINAL_SHA} to staging first:"
-              echo "  Comment: [staging] on the PR for this SHA"
-              echo ""
-              echo "Note: For production rollback, staging image gating is not required,"
-              echo "but the image must exist locally on the runner."
-              exit 1
+            # Verify commit exists
+            if ! git cat-file -e ${FINAL_SHA} 2>/dev/null; then
+              echo "❌ ERROR: Rollback commit does not exist: ${FINAL_SHA}"
+              echo "Fetching all refs to ensure commit is available..."
+              git fetch origin
+              if ! git cat-file -e ${FINAL_SHA} 2>/dev/null; then
+                echo "❌ ERROR: Commit still not found after fetch: ${FINAL_SHA}"
+                exit 1
+              fi
             fi
-            echo "✅ Rollback image verified: ${TARGET_IMAGE}"
+            echo "✅ Rollback commit verified: ${FINAL_SHA}"
 
-            # Stop and remove existing container
-            if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "🛑 Stopping existing container: ${CONTAINER_NAME}"
-              docker stop ${CONTAINER_NAME} 2>/dev/null || true
-              echo "🗑️  Removing existing container: ${CONTAINER_NAME}"
-              docker rm ${CONTAINER_NAME} 2>/dev/null || true
+            # Stop existing service
+            echo "🛑 Stopping existing service..."
+            pkill -f "uvicorn app.main" || true
+            sleep 2
+
+            # Checkout rollback target
+            echo "🔀 Checking out rollback target: ${FINAL_SHA}"
+            git checkout ${FINAL_SHA}
+
+            # Install dependencies
+            if [ -f requirements.txt ]; then
+              echo "📦 Installing dependencies..."
+              python3 -m venv venv || true
+              source venv/bin/activate
+              pip install -q -r requirements.txt
             fi
 
-            # Get image digest before deployment
-            IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${TARGET_IMAGE} 2>/dev/null || echo "")
-            if [ -z "$IMAGE_DIGEST" ]; then
-              IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${TARGET_IMAGE})
-            fi
-            echo "🔐 Image Digest: ${IMAGE_DIGEST}"
+            # Start service
+            echo "▶️  Starting service on port ${PORT}..."
+            export COMMIT_SHA="${FINAL_SHA}"
+            export ENVIRONMENT="${ENVIRONMENT}"
+            export DEPLOYMENT_ID="${{ github.run_id }}"
+            export PORT="${PORT}"
+            export API_KEY="${API_KEY}"
+            export DB_HOST="${DB_HOST}"
 
-            # Run rollback container with runtime env injection
-            echo "▶️  Running rollback container: ${CONTAINER_NAME}"
-            docker run -d \
-              --name ${CONTAINER_NAME} \
-              -p ${PORT}:8000 \
-              -e ENVIRONMENT=${ENVIRONMENT} \
-              -e DEPLOYMENT_ID="${{ github.run_id }}" \
-              -e CONTAINER_NAME=${CONTAINER_NAME} \
-              -e PORT=${PORT} \
-              -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
-              -e API_KEY="${API_KEY}" \
-              -e DB_HOST="${DB_HOST}" \
-              ${TARGET_IMAGE}
+            nohup venv/bin/uvicorn app.main:app \
+              --host 0.0.0.0 \
+              --port ${PORT} \
+              > app.log 2>&1 &
 
-            ACTUAL_IMAGE="${TARGET_IMAGE}"
+            echo "service_pid=$!" >> $GITHUB_OUTPUT
 
             # Wait for startup
             echo "⏳ Waiting for service to start..."
@@ -1364,16 +1373,7 @@ jobs:
           # ============================================================
           echo "🏥 Checking service health..."
 
-          # Verify container is running
-          if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "❌ Container failed to start or restart"
-            docker logs ${CONTAINER_NAME} 2>/dev/null || true
-            HEALTH_STATUS="failed"
-            echo "health_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-
-          # Verify HTTP endpoint is responding (same retry logic as deploy.yml)
+          # Verify HTTP endpoint is responding
           MAX_RETRIES=${HEALTH_CHECK_MAX_RETRIES}
           RETRY_COUNT=0
 
@@ -1389,38 +1389,35 @@ jobs:
           done
 
           if [ "$HEALTH_STATUS" != "healthy" ]; then
-            echo "⚠️  Warning: Service health check did not pass within timeout"
-            echo "   Container is running but may not be fully ready"
-            HEALTH_STATUS="running_unverified"
+            echo "❌ Service health check failed"
+            echo "📋 Last 50 lines of app.log:"
+            tail -50 app.log || true
+            HEALTH_STATUS="failed"
+            echo "health_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
+            exit 1
           fi
 
           # ============================================================
           # RECORD TO LOCAL HISTORY (only on successful operations)
           # ============================================================
-          # Note: We only reach this point if:
-          #   1. Container is running (verified above)
-          #   2. Health check passed or timed out with "running_unverified"
-          # If container failed to start, we would have exited above with exit 1
           HISTORY_FILE="/tmp/myapp-${ENVIRONMENT}.history"
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+          # Get current SHA for history
+          CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+
           # Record all ops actions to history (restart, redeploy, rollback)
-          if [ -n "$FINAL_SHA" ]; then
+          if [ -n "$CURRENT_SHA" ]; then
             echo "📝 Recording to local history: ${HISTORY_FILE}"
-            echo "${TIMESTAMP} action=${ACTION} sha=${FINAL_SHA} image=${ACTUAL_IMAGE:-${IMAGE_NAME}:${FINAL_SHA}} digest=${IMAGE_DIGEST} run_id=${{ github.run_id }}" >> ${HISTORY_FILE}
-          elif [ "$ACTION" = "restart" ] && [ -n "$ACTUAL_IMAGE" ]; then
-            # Record restart with image info (helpful for tracking)
-            echo "📝 Recording restart to local history: ${HISTORY_FILE}"
-            echo "${TIMESTAMP} action=${ACTION} image=${ACTUAL_IMAGE} digest=${IMAGE_DIGEST} run_id=${{ github.run_id }}" >> ${HISTORY_FILE}
+            echo "${TIMESTAMP} action=${ACTION} sha=${CURRENT_SHA} run_id=${{ github.run_id }}" >> ${HISTORY_FILE}
           fi
 
           # Set outputs
           echo "health_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
-          echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
 
           echo "✅ Ops operation completed successfully"
           echo "🏥 Health: ${HEALTH_STATUS}"
-          echo "🔐 Digest: ${IMAGE_DIGEST}"
+          echo "📍 SHA: ${CURRENT_SHA}"
 
       # STEP 8: Post ops status comment
       # Posts result to Ops Console issue
@@ -1431,7 +1428,6 @@ jobs:
           script: |
             const action = '${{ steps.validate.outputs.action }}';
             const environment = '${{ steps.validate.outputs.environment }}';
-            const containerName = '${{ steps.validate.outputs.container_name }}';
             const port = '${{ steps.validate.outputs.port }}';
             const requester = '${{ steps.validate.outputs.requester }}';
             const finalSha = '${{ steps.determine_sha.outputs.final_sha }}';
@@ -1441,7 +1437,6 @@ jobs:
             const usedApi = '${{ steps.compute_rollback_api.outputs.used_api }}';
             const jobStatus = '${{ job.status }}';
             const healthStatus = '${{ steps.execute_ops.outputs.health_status }}';
-            const imageDigest = '${{ steps.execute_ops.outputs.image_digest }}';
 
             const statusEmoji = jobStatus === 'success' ? '✅' : '❌';
             const statusText = jobStatus === 'success' ? 'SUCCEEDED' : 'FAILED';
@@ -1481,9 +1476,7 @@ jobs:
             | **Requested By** | @${requester} |
             | **Target** | ${targetDesc} |
             | **Result SHA** | \`${finalSha || 'N/A'}\` |
-            | **Container** | \`${containerName}\` |
             | **Port** | \`${port}\` |
-            ${imageDigest ? `| **Image Digest** | \`${imageDigest.substring(0, 80)}${imageDigest.length > 80 ? '...' : ''}\` |` : ''}
             | **Service Status** | ${healthDisplay} |
             `;
 
