@@ -78,6 +78,9 @@ concurrency:
 
 jobs:
   ops:
+    # Only run on workflow_dispatch OR on regular issues (not PRs) with issue number matching OPS_ISSUE_NUMBER
+    # This prevents the workflow from starting on PR comments, which are handled by deploy.yml
+    if: github.event_name == 'workflow_dispatch' || (github.event.issue.pull_request == null && github.event.issue.number == 2)
     runs-on: self-hosted
 
     # GitHub Environment protection (requires manual approval for production if configured)
