@@ -56,7 +56,7 @@ env:
   # VM deployment configuration constants
   STAGING_PORT: 9001
   PROD_PORT: 9002
-  SERVICE_DIR: /var/www/myservice
+  SERVICE_DIR: $HOME/deployments/myservice
   HEALTH_CHECK_MAX_RETRIES: 10
   HEALTH_CHECK_RETRY_SLEEP: 2
 
@@ -1198,8 +1198,7 @@ jobs:
           # Ensure service directory exists
           if [ ! -d "${SERVICE_DIR}" ]; then
             echo "📁 Creating service directory: ${SERVICE_DIR}"
-            sudo mkdir -p ${SERVICE_DIR}
-            sudo chown -R $(whoami) ${SERVICE_DIR}
+            mkdir -p ${SERVICE_DIR}
             cd ${SERVICE_DIR}
             git clone ${{ github.server_url }}/${{ github.repository }} .
           fi

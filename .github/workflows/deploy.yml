@@ -25,7 +25,7 @@ env:
   # VM deployment configuration constants
   STAGING_PORT: 9001
   PROD_PORT: 9002
-  SERVICE_DIR: /var/www/myservice
+  SERVICE_DIR: $HOME/deployments/myservice
   HEALTH_CHECK_MAX_RETRIES: 10
   HEALTH_CHECK_RETRY_SLEEP: 2
 
@@ -582,8 +582,7 @@ jobs:
           # Ensure service directory exists
           if [ ! -d "${SERVICE_DIR}" ]; then
             echo "📁 Creating service directory: ${SERVICE_DIR}"
-            sudo mkdir -p ${SERVICE_DIR}
-            sudo chown -R $(whoami) ${SERVICE_DIR}
+            mkdir -p ${SERVICE_DIR}
             cd ${SERVICE_DIR}
             git clone ${{ github.server_url }}/${{ github.repository }} .
           fi
@@ -596,18 +595,36 @@ jobs:
           pkill -f "uvicorn app.main" || true
           sleep 2
 
+          # Save current requirements hash (if exists)
+          OLD_REQ_HASH=""
+          if [ -f requirements.txt ]; then
+            OLD_REQ_HASH=$(md5sum requirements.txt 2>/dev/null | cut -d' ' -f1 || echo "")
+          fi
+
           # Fetch and checkout target commit
           echo "📥 Fetching repository updates..."
           git fetch origin
           echo "🔀 Checking out commit: ${COMMIT_SHA}"
           git checkout ${COMMIT_SHA}
 
-          # Install dependencies if requirements.txt exists
+          # Smart dependency installation - only reinstall if requirements changed
           if [ -f requirements.txt ]; then
-            echo "📦 Installing dependencies..."
-            python3 -m venv venv || true
-            source venv/bin/activate
-            pip install -q -r requirements.txt
+            NEW_REQ_HASH=$(md5sum requirements.txt 2>/dev/null | cut -d' ' -f1 || echo "")
+
+            if [ ! -d "venv" ]; then
+              echo "📦 Creating new virtual environment..."
+              python3 -m venv venv
+              source venv/bin/activate
+              echo "📦 Installing dependencies (fresh install)..."
+              pip install -q -r requirements.txt
+            elif [ "$OLD_REQ_HASH" != "$NEW_REQ_HASH" ] || [ -z "$OLD_REQ_HASH" ]; then
+              echo "📦 Requirements changed - reinstalling dependencies..."
+              source venv/bin/activate
+              pip install -q -r requirements.txt
+            else
+              echo "✅ Requirements unchanged - reusing existing dependencies"
+              source venv/bin/activate
+            fi
           fi
 
           # Start service in background
@@ -737,8 +754,7 @@ jobs:
           # Ensure service directory exists
           if [ ! -d "${SERVICE_DIR}" ]; then
             echo "📁 Creating service directory: ${SERVICE_DIR}"
-            sudo mkdir -p ${SERVICE_DIR}
-            sudo chown -R $(whoami) ${SERVICE_DIR}
+            mkdir -p ${SERVICE_DIR}
             cd ${SERVICE_DIR}
             git clone ${{ github.server_url }}/${{ github.repository }} .
           fi
@@ -751,18 +767,36 @@ jobs:
           pkill -f "uvicorn app.main" || true
           sleep 2
 
+          # Save current requirements hash (if exists)
+          OLD_REQ_HASH=""
+          if [ -f requirements.txt ]; then
+            OLD_REQ_HASH=$(md5sum requirements.txt 2>/dev/null | cut -d' ' -f1 || echo "")
+          fi
+
           # Fetch and checkout target commit
           echo "📥 Fetching repository updates..."
           git fetch origin
           echo "🔀 Checking out commit: ${COMMIT_SHA}"
           git checkout ${COMMIT_SHA}
 
-          # Install dependencies if requirements.txt exists
+          # Smart dependency installation - only reinstall if requirements changed
           if [ -f requirements.txt ]; then
-            echo "📦 Installing dependencies..."
-            python3 -m venv venv || true
-            source venv/bin/activate
-            pip install -q -r requirements.txt
+            NEW_REQ_HASH=$(md5sum requirements.txt 2>/dev/null | cut -d' ' -f1 || echo "")
+
+            if [ ! -d "venv" ]; then
+              echo "📦 Creating new virtual environment..."
+              python3 -m venv venv
+              source venv/bin/activate
+              echo "📦 Installing dependencies (fresh install)..."
+              pip install -q -r requirements.txt
+            elif [ "$OLD_REQ_HASH" != "$NEW_REQ_HASH" ] || [ -z "$OLD_REQ_HASH" ]; then
+              echo "📦 Requirements changed - reinstalling dependencies..."
+              source venv/bin/activate
+              pip install -q -r requirements.txt
+            else
+              echo "✅ Requirements unchanged - reusing existing dependencies"
+              source venv/bin/activate
+            fi
           fi
 
           # Start service in background on production port
