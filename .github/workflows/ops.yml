@@ -1147,7 +1147,7 @@ EOF
 
           # ============================================================
           # REDEPLOY & ROLLBACK OPERATIONS
-          # Both operations deploy a specific SHA, so they use the same function
+          # Both operations deploy a specific SHA with identical logic
           # ============================================================
           elif [ "$ACTION" = "redeploy" ] || [ "$ACTION" = "rollback" ]; then
 
@@ -1172,10 +1172,9 @@ EOF
               exit 1
             fi
 
-            # Reusable deployment function for redeploy and rollback
-            deploy_to_sha() {
-              echo "🔐 Connecting to VM via SSH..."
-              ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
+            # SSH into VM and deploy
+            echo "🔐 Connecting to VM via SSH..."
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
 set -euo pipefail
 
 cd ${VM_APP_PATH}
@@ -1224,10 +1223,6 @@ sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
 
 echo "✅ Deployment complete!"
 EOF
-            }
-
-            # Execute deployment
-            deploy_to_sha
 
             echo "✅ ${ACTION^} completed successfully"
             echo "📍 SHA: ${FINAL_SHA}"

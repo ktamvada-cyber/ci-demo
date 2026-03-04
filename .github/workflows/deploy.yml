@@ -600,10 +600,9 @@ jobs:
             exit 1
           fi
 
-          # Reusable deployment function
-          deploy() {
-            echo "🔐 Connecting to VM via SSH..."
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
+          # SSH into VM and deploy using exact commit SHA
+          echo "🔐 Connecting to VM via SSH..."
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
 set -euo pipefail
 
 cd ${VM_APP_PATH}
@@ -652,10 +651,6 @@ sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
 
 echo "✅ Deployment complete!"
 EOF
-          }
-
-          # Execute deployment
-          deploy
 
           # Set deployment status
           echo "readiness_status=deployed" >> $GITHUB_OUTPUT
@@ -781,10 +776,9 @@ EOF
             exit 1
           fi
 
-          # Reusable deployment function
-          deploy() {
-            echo "🔐 Connecting to VM via SSH..."
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
+          # SSH into VM and deploy using exact commit SHA
+          echo "🔐 Connecting to VM via SSH..."
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
 set -euo pipefail
 
 cd ${VM_APP_PATH}
@@ -814,7 +808,7 @@ RETRY_DELAY=2
 RETRY_COUNT=0
 
 while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
-if curl -f -s http://localhost:8000/ >/dev/null; then
+if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
 echo "✅ Health check passed"
 break
 fi
@@ -833,10 +827,6 @@ sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
 
 echo "✅ Deployment complete!"
 EOF
-          }
-
-          # Execute deployment
-          deploy
 
           # Set deployment status
           echo "readiness_status=deployed" >> $GITHUB_OUTPUT
