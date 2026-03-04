@@ -1263,7 +1263,7 @@ jobs:
             echo "✅ Deployment complete!"
           SCRIPT_EOF
 
-            echo "✅ ${ACTION^} completed successfully"
+            echo "✅ ${ACTION} completed successfully"
             echo "📍 SHA: ${FINAL_SHA}"
             echo "🖥️  VM: ${VM_HOST}"
           fi
