@@ -638,6 +638,16 @@ jobs:
           echo "📍 Checking out commit SHA: ${COMMIT_SHA}"
           git checkout ${COMMIT_SHA}
 
+          echo "📝 Writing environment variables..."
+          cat > ${VM_APP_PATH}/.env <<ENV_FILE
+          ENVIRONMENT=${ENVIRONMENT}
+          DEPLOYMENT_ID=${{ github.run_id }}
+          API_KEY=${API_KEY}
+          DB_HOST=${DB_HOST}
+          PORT=8000
+          COMMIT_SHA=${COMMIT_SHA}
+          ENV_FILE
+
           echo "🔄 Restarting service..."
           sudo systemctl restart ${VM_SERVICE_NAME}
 
@@ -810,6 +820,16 @@ jobs:
 
           echo "📍 Checking out commit SHA: ${COMMIT_SHA}"
           git checkout ${COMMIT_SHA}
+
+          echo "📝 Writing environment variables..."
+          cat > ${VM_APP_PATH}/.env <<ENV_FILE
+          ENVIRONMENT=${ENVIRONMENT}
+          DEPLOYMENT_ID=${{ github.run_id }}
+          API_KEY=${API_KEY}
+          DB_HOST=${DB_HOST}
+          PORT=8000
+          COMMIT_SHA=${COMMIT_SHA}
+          ENV_FILE
 
           echo "🔄 Restarting service..."
           sudo systemctl restart ${VM_SERVICE_NAME}

@@ -1115,8 +1115,25 @@ jobs:
 
             # SSH into VM and restart service
             # Pass environment variables explicitly to avoid variable expansion issues
-            cat <<'SCRIPT_EOF' | ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} VM_SERVICE_NAME="${VM_SERVICE_NAME}" bash -s
+            cat <<'SCRIPT_EOF' | ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+              VM_SERVICE_NAME="${VM_SERVICE_NAME}" \
+              VM_APP_PATH="${VM_APP_PATH}" \
+              ENVIRONMENT="${ENVIRONMENT}" \
+              DEPLOYMENT_ID="${{ github.run_id }}" \
+              API_KEY="${API_KEY}" \
+              DB_HOST="${DB_HOST}" \
+              bash -s
             set -euo pipefail
+
+            echo "📝 Writing environment variables..."
+            cat > "$VM_APP_PATH/.env" <<ENV_EOF
+          ENVIRONMENT=$ENVIRONMENT
+          DEPLOYMENT_ID=$DEPLOYMENT_ID
+          API_KEY=$API_KEY
+          DB_HOST=$DB_HOST
+          PORT=8000
+          COMMIT_SHA=$(cd "$VM_APP_PATH" && git rev-parse HEAD 2>/dev/null || echo "unknown")
+          ENV_EOF
 
             echo "🔄 Restarting service..."
             sudo systemctl restart "$VM_SERVICE_NAME"
@@ -1177,7 +1194,15 @@ jobs:
             # SSH into VM and deploy
             # Pass environment variables explicitly to avoid variable expansion issues
             echo "🔐 Connecting to VM via SSH..."
-            cat <<'SCRIPT_EOF' | ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} VM_APP_PATH="${VM_APP_PATH}" FINAL_SHA="${FINAL_SHA}" VM_SERVICE_NAME="${VM_SERVICE_NAME}" bash -s
+            cat <<'SCRIPT_EOF' | ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+              VM_APP_PATH="${VM_APP_PATH}" \
+              FINAL_SHA="${FINAL_SHA}" \
+              VM_SERVICE_NAME="${VM_SERVICE_NAME}" \
+              ENVIRONMENT="${ENVIRONMENT}" \
+              DEPLOYMENT_ID="${{ github.run_id }}" \
+              API_KEY="${API_KEY}" \
+              DB_HOST="${DB_HOST}" \
+              bash -s
             set -euo pipefail
 
             cd "$VM_APP_PATH"
@@ -1198,6 +1223,16 @@ jobs:
             echo "✅ Verifying checkout succeeded..."
             DEPLOYED_SHA=$(git rev-parse HEAD)
             echo "Deployed SHA: $DEPLOYED_SHA"
+
+            echo "📝 Writing environment variables..."
+            cat > "$VM_APP_PATH/.env" <<ENV_EOF
+          ENVIRONMENT=$ENVIRONMENT
+          DEPLOYMENT_ID=$DEPLOYMENT_ID
+          API_KEY=$API_KEY
+          DB_HOST=$DB_HOST
+          PORT=8000
+          COMMIT_SHA=$DEPLOYED_SHA
+          ENV_EOF
 
             echo "🔄 Restarting service..."
             sudo systemctl restart "$VM_SERVICE_NAME"
