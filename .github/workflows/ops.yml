@@ -1145,7 +1145,7 @@ jobs:
             done
 
             echo "✅ Restart complete!"
-            SCRIPT_EOF
+          SCRIPT_EOF
 
           # ============================================================
           # REDEPLOY & ROLLBACK OPERATIONS
@@ -1226,7 +1226,7 @@ jobs:
             done
 
             echo "✅ Deployment complete!"
-            SCRIPT_EOF
+          SCRIPT_EOF
 
             echo "✅ ${ACTION^} completed successfully"
             echo "📍 SHA: ${FINAL_SHA}"
