@@ -1053,6 +1053,27 @@ jobs:
               log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             });
 
+      # STEP 6.5: Setup SSH Key for VM Access
+      # Configure SSH authentication to connect to the VM
+      # SECURITY: SSH private key stored as GitHub secret
+      - name: Setup SSH Key for VM Access
+        if: steps.validate.outputs.should_run == 'true'
+        run: |
+          echo "🔐 Configuring SSH authentication..."
+
+          # Create .ssh directory with correct permissions
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Install SSH private key from secrets
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # Add VM host to known_hosts to avoid host verification prompt
+          ssh-keyscan -H ${{ env.VM_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+          echo "✅ SSH key configured for ${VM_USER}@${VM_HOST}"
+
       # STEP 7: Execute ops operation
       # Performs restart, redeploy, or rollback via SSH on VM
       - name: Execute Ops Operation
@@ -1136,6 +1157,9 @@ jobs:
 
             cd ${VM_APP_PATH}
 
+            echo "🔧 Configuring git safe directory..."
+            git config --global --add safe.directory ${VM_APP_PATH}
+
             echo "📥 Fetching latest code from origin..."
             git fetch origin
 
@@ -1202,6 +1226,9 @@ jobs:
             set -euo pipefail
 
             cd ${VM_APP_PATH}
+
+            echo "🔧 Configuring git safe directory..."
+            git config --global --add safe.directory ${VM_APP_PATH}
 
             echo "📥 Fetching latest code from origin..."
             git fetch origin
