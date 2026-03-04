@@ -459,6 +459,8 @@ jobs:
         id: build_metadata
         if: steps.validate.outputs.should_deploy == 'true'
         run: |
+          set -euo pipefail
+
           # Capture build timestamp in ISO 8601 format
           BUILD_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           echo "build_timestamp=${BUILD_TIMESTAMP}" >> $GITHUB_OUTPUT
@@ -477,6 +479,8 @@ jobs:
       - name: Setup SSH Key for VM Access
         if: steps.validate.outputs.should_deploy == 'true'
         run: |
+          set -euo pipefail
+
           echo "🔐 Configuring SSH authentication..."
 
           # Create .ssh directory with correct permissions
@@ -502,11 +506,13 @@ jobs:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
           ENVIRONMENT: ${{ steps.validate.outputs.environment }}
         run: |
+          set -euo pipefail
+
           echo "🔍 Checking current deployment on VM..."
 
           # SSH into VM and check currently deployed SHA
-          CURRENT_SHA=$(ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_HOST} \
-            "git config --global --add safe.directory ${VM_APP_PATH} 2>/dev/null || true; cd ${VM_APP_PATH} && git rev-parse HEAD" 2>/dev/null || echo "unknown")
+          CURRENT_SHA=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+            "git -C ${VM_APP_PATH} rev-parse HEAD 2>/dev/null || echo unknown" 2>/dev/null || echo "unknown")
 
           echo "📍 Current SHA: ${CURRENT_SHA}"
           echo "📍 Target SHA:  ${COMMIT_SHA}"
@@ -576,6 +582,12 @@ jobs:
           API_KEY: ${{ secrets.API_KEY }}
           DB_HOST: ${{ secrets.DB_HOST }}
         run: |
+          set -euo pipefail
+
+          echo "Runner: $(hostname)"
+          echo "GitHub SHA: ${COMMIT_SHA}"
+          echo "VM: ${VM_HOST}"
+          echo ""
           echo "🚀 Starting staging deployment..."
           echo "📍 Commit SHA: ${COMMIT_SHA}"
           echo "🏷️  Environment: ${ENVIRONMENT}"
@@ -588,57 +600,62 @@ jobs:
             exit 1
           fi
 
-          # SSH into VM and deploy using exact commit SHA
-          echo "🔐 Connecting to VM via SSH..."
-          ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_HOST} "bash -s" << EOF
-          set -euo pipefail
+          # Reusable deployment function
+          deploy() {
+            echo "🔐 Connecting to VM via SSH..."
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
+set -euo pipefail
 
-          cd ${VM_APP_PATH}
+cd ${VM_APP_PATH}
 
-          echo "🔧 Configuring git safe directory..."
-          git config --global --add safe.directory ${VM_APP_PATH}
+echo "🔧 Configuring git safe directory..."
+git config --global --add safe.directory ${VM_APP_PATH}
 
-          echo "📥 Fetching latest code from origin..."
-          git fetch origin
+echo "📥 Fetching latest code from origin..."
+git fetch --prune --tags origin
 
-          echo "🧹 Cleaning working directory..."
-          git reset --hard
-          git clean -fd
+echo "🧹 Cleaning working directory..."
+git reset --hard
+git clean -fd
 
-          echo "📍 Checking out commit SHA: ${COMMIT_SHA}"
-          git checkout ${COMMIT_SHA}
+echo "📍 Checking out commit SHA: ${COMMIT_SHA}"
+git checkout ${COMMIT_SHA}
 
-          echo "🔄 Restarting service..."
-          sudo systemctl restart ${VM_SERVICE_NAME}
+echo "🔄 Restarting service..."
+sudo systemctl restart ${VM_SERVICE_NAME}
 
-          echo "⏳ Waiting for service to initialize..."
-          sleep 3
+echo "⏳ Waiting for service to initialize..."
+sleep 3
 
-          echo "🏥 Checking health endpoint..."
-          MAX_RETRIES=10
-          RETRY_DELAY=2
-          RETRY_COUNT=0
+echo "🏥 Checking health endpoint..."
+MAX_RETRIES=10
+RETRY_DELAY=2
+RETRY_COUNT=0
 
-          while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
-            if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
-              echo "✅ Health check passed"
-              break
-            fi
-            RETRY_COUNT=\$((RETRY_COUNT + 1))
-            if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
-              echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-              sleep \$RETRY_DELAY
-            else
-              echo "❌ Health check failed after \$MAX_RETRIES attempts"
-              exit 1
-            fi
-          done
+while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
+if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
+echo "✅ Health check passed"
+break
+fi
+RETRY_COUNT=\$((RETRY_COUNT + 1))
+if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
+echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
+sleep \$RETRY_DELAY
+else
+echo "❌ Health check failed after \$MAX_RETRIES attempts"
+exit 1
+fi
+done
 
-          echo "📊 Checking service status..."
-          sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
+echo "📊 Checking service status..."
+sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
 
-          echo "✅ Deployment complete!"
-          EOF
+echo "✅ Deployment complete!"
+EOF
+          }
+
+          # Execute deployment
+          deploy
 
           # Set deployment status
           echo "readiness_status=deployed" >> $GITHUB_OUTPUT
@@ -746,6 +763,12 @@ jobs:
           API_KEY: ${{ secrets.API_KEY }}
           DB_HOST: ${{ secrets.DB_HOST }}
         run: |
+          set -euo pipefail
+
+          echo "Runner: $(hostname)"
+          echo "GitHub SHA: ${COMMIT_SHA}"
+          echo "VM: ${VM_HOST}"
+          echo ""
           echo "🚀 Starting production deployment..."
           echo "📍 Commit SHA: ${COMMIT_SHA}"
           echo "🏷️  Environment: ${ENVIRONMENT}"
@@ -758,57 +781,62 @@ jobs:
             exit 1
           fi
 
-          # SSH into VM and deploy using exact commit SHA
-          echo "🔐 Connecting to VM via SSH..."
-          ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_HOST} "bash -s" << EOF
-          set -euo pipefail
+          # Reusable deployment function
+          deploy() {
+            echo "🔐 Connecting to VM via SSH..."
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
+set -euo pipefail
 
-          cd ${VM_APP_PATH}
+cd ${VM_APP_PATH}
 
-          echo "🔧 Configuring git safe directory..."
-          git config --global --add safe.directory ${VM_APP_PATH}
+echo "🔧 Configuring git safe directory..."
+git config --global --add safe.directory ${VM_APP_PATH}
 
-          echo "📥 Fetching latest code from origin..."
-          git fetch origin
+echo "📥 Fetching latest code from origin..."
+git fetch --prune --tags origin
 
-          echo "🧹 Cleaning working directory..."
-          git reset --hard
-          git clean -fd
+echo "🧹 Cleaning working directory..."
+git reset --hard
+git clean -fd
 
-          echo "📍 Checking out commit SHA: ${COMMIT_SHA}"
-          git checkout ${COMMIT_SHA}
+echo "📍 Checking out commit SHA: ${COMMIT_SHA}"
+git checkout ${COMMIT_SHA}
 
-          echo "🔄 Restarting service..."
-          sudo systemctl restart ${VM_SERVICE_NAME}
+echo "🔄 Restarting service..."
+sudo systemctl restart ${VM_SERVICE_NAME}
 
-          echo "⏳ Waiting for service to initialize..."
-          sleep 3
+echo "⏳ Waiting for service to initialize..."
+sleep 3
 
-          echo "🏥 Checking health endpoint..."
-          MAX_RETRIES=10
-          RETRY_DELAY=2
-          RETRY_COUNT=0
+echo "🏥 Checking health endpoint..."
+MAX_RETRIES=10
+RETRY_DELAY=2
+RETRY_COUNT=0
 
-          while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
-            if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
-              echo "✅ Health check passed"
-              break
-            fi
-            RETRY_COUNT=\$((RETRY_COUNT + 1))
-            if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
-              echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-              sleep \$RETRY_DELAY
-            else
-              echo "❌ Health check failed after \$MAX_RETRIES attempts"
-              exit 1
-            fi
-          done
+while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
+if curl -f -s http://localhost:8000/ >/dev/null; then
+echo "✅ Health check passed"
+break
+fi
+RETRY_COUNT=\$((RETRY_COUNT + 1))
+if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
+echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
+sleep \$RETRY_DELAY
+else
+echo "❌ Health check failed after \$MAX_RETRIES attempts"
+exit 1
+fi
+done
 
-          echo "📊 Checking service status..."
-          sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
+echo "📊 Checking service status..."
+sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
 
-          echo "✅ Deployment complete!"
-          EOF
+echo "✅ Deployment complete!"
+EOF
+          }
+
+          # Execute deployment
+          deploy
 
           # Set deployment status
           echo "readiness_status=deployed" >> $GITHUB_OUTPUT

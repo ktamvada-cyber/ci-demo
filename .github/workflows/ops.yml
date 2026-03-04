@@ -516,16 +516,19 @@ jobs:
         env:
           ENVIRONMENT: ${{ steps.validate.outputs.environment }}
         run: |
+          set -euo pipefail
+
           echo "🔍 Determining current deployment state on VM..."
 
           # SSH into VM and get current SHA
-          CURRENT_SHA=$(ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_HOST} \
-            "cd ${VM_APP_PATH} && git rev-parse HEAD" 2>/dev/null || echo "")
+          CURRENT_SHA=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+            "git -C ${VM_APP_PATH} rev-parse HEAD 2>/dev/null || echo unknown" 2>/dev/null || echo "")
 
-          if [ -n "$CURRENT_SHA" ]; then
+          if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" != "unknown" ]; then
             echo "📍 Current SHA: ${CURRENT_SHA}"
           else
             echo "⚠️  Could not determine current SHA from VM"
+            CURRENT_SHA=""
           fi
 
           # Output results
@@ -708,6 +711,8 @@ jobs:
           API_TARGET_SHA: ${{ steps.compute_rollback_api.outputs.api_target_sha }}
           USED_API: ${{ steps.compute_rollback_api.outputs.used_api }}
         run: |
+          set -euo pipefail
+
           echo "🔍 Determining target SHA for ${ACTION}..."
 
           FINAL_SHA=""
@@ -1059,6 +1064,8 @@ jobs:
       - name: Setup SSH Key for VM Access
         if: steps.validate.outputs.should_run == 'true'
         run: |
+          set -euo pipefail
+
           echo "🔐 Configuring SSH authentication..."
 
           # Create .ssh directory with correct permissions
@@ -1086,6 +1093,12 @@ jobs:
           API_KEY: ${{ secrets.API_KEY }}
           DB_HOST: ${{ secrets.DB_HOST }}
         run: |
+          set -euo pipefail
+
+          echo "Runner: $(hostname)"
+          echo "GitHub Run ID: ${{ github.run_id }}"
+          echo "VM: ${VM_HOST}"
+          echo ""
           echo "Executing ops operation: ${ACTION} on ${ENVIRONMENT}"
           echo "VM Host: ${VM_HOST}"
           echo "App Path: ${VM_APP_PATH}"
@@ -1097,53 +1110,61 @@ jobs:
             echo "♻️  Performing restart operation..."
 
             # SSH into VM and restart service
-            ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_HOST} "bash -s" << EOF
-            set -euo pipefail
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
+set -euo pipefail
 
-            echo "🔄 Restarting service..."
-            sudo systemctl restart ${VM_SERVICE_NAME}
+echo "🔄 Restarting service..."
+sudo systemctl restart ${VM_SERVICE_NAME}
 
-            echo "⏳ Waiting for service to initialize..."
-            sleep 3
+echo "⏳ Waiting for service to initialize..."
+sleep 3
 
-            echo "🏥 Checking health endpoint..."
-            MAX_RETRIES=10
-            RETRY_DELAY=2
-            RETRY_COUNT=0
+echo "🏥 Checking health endpoint..."
+MAX_RETRIES=10
+RETRY_DELAY=2
+RETRY_COUNT=0
 
-            while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
-              if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
-                echo "✅ Health check passed"
-                break
-              fi
-              RETRY_COUNT=\$((RETRY_COUNT + 1))
-              if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
-                echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-                sleep \$RETRY_DELAY
-              else
-                echo "❌ Health check failed after \$MAX_RETRIES attempts"
-                exit 1
-              fi
-            done
+while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
+if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
+echo "✅ Health check passed"
+break
+fi
+RETRY_COUNT=\$((RETRY_COUNT + 1))
+if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
+echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
+sleep \$RETRY_DELAY
+else
+echo "❌ Health check failed after \$MAX_RETRIES attempts"
+exit 1
+fi
+done
 
-            echo "📊 Checking service status..."
-            sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
+echo "📊 Checking service status..."
+sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
 
-            echo "✅ Restart complete!"
-            EOF
+echo "✅ Restart complete!"
+EOF
 
           # ============================================================
-          # REDEPLOY OPERATION
+          # REDEPLOY & ROLLBACK OPERATIONS
+          # Both operations deploy a specific SHA, so they use the same function
           # ============================================================
-          elif [ "$ACTION" = "redeploy" ]; then
-            echo "🔄 Performing redeploy operation..."
+          elif [ "$ACTION" = "redeploy" ] || [ "$ACTION" = "rollback" ]; then
 
+            # Display operation-specific message
+            if [ "$ACTION" = "redeploy" ]; then
+              echo "🔄 Performing redeploy operation..."
+            else
+              echo "⏪ Performing rollback operation..."
+            fi
+
+            # Validate SHA is provided
             if [ -z "$FINAL_SHA" ]; then
-              echo "❌ ERROR: Cannot redeploy without target SHA"
+              echo "❌ ERROR: Cannot ${ACTION} without target SHA"
               exit 1
             fi
 
-            echo "🎯 Redeploy target SHA: ${FINAL_SHA}"
+            echo "🎯 Target SHA: ${FINAL_SHA}"
 
             # Validate SHA format before SSH
             if ! [[ "${FINAL_SHA}" =~ ^[a-f0-9]{40}$ ]]; then
@@ -1151,126 +1172,66 @@ jobs:
               exit 1
             fi
 
-            # SSH into VM and redeploy
-            ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_HOST} "bash -s" << EOF
-            set -euo pipefail
+            # Reusable deployment function for redeploy and rollback
+            deploy_to_sha() {
+              echo "🔐 Connecting to VM via SSH..."
+              ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
+set -euo pipefail
 
-            cd ${VM_APP_PATH}
+cd ${VM_APP_PATH}
 
-            echo "🔧 Configuring git safe directory..."
-            git config --global --add safe.directory ${VM_APP_PATH}
+echo "🔧 Configuring git safe directory..."
+git config --global --add safe.directory ${VM_APP_PATH}
 
-            echo "📥 Fetching latest code from origin..."
-            git fetch origin
+echo "📥 Fetching latest code from origin..."
+git fetch --prune --tags origin
 
-            echo "🧹 Cleaning working directory..."
-            git reset --hard
-            git clean -fd
+echo "🧹 Cleaning working directory..."
+git reset --hard
+git clean -fd
 
-            echo "📍 Checking out commit SHA: ${FINAL_SHA}"
-            git checkout ${FINAL_SHA}
+echo "📍 Checking out commit SHA: ${FINAL_SHA}"
+git checkout ${FINAL_SHA}
 
-            echo "🔄 Restarting service..."
-            sudo systemctl restart ${VM_SERVICE_NAME}
+echo "🔄 Restarting service..."
+sudo systemctl restart ${VM_SERVICE_NAME}
 
-            echo "⏳ Waiting for service to initialize..."
-            sleep 3
+echo "⏳ Waiting for service to initialize..."
+sleep 3
 
-            echo "🏥 Checking health endpoint..."
-            MAX_RETRIES=10
-            RETRY_DELAY=2
-            RETRY_COUNT=0
+echo "🏥 Checking health endpoint..."
+MAX_RETRIES=10
+RETRY_DELAY=2
+RETRY_COUNT=0
 
-            while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
-              if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
-                echo "✅ Health check passed"
-                break
-              fi
-              RETRY_COUNT=\$((RETRY_COUNT + 1))
-              if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
-                echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-                sleep \$RETRY_DELAY
-              else
-                echo "❌ Health check failed after \$MAX_RETRIES attempts"
-                exit 1
-              fi
-            done
+while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
+if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
+echo "✅ Health check passed"
+break
+fi
+RETRY_COUNT=\$((RETRY_COUNT + 1))
+if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
+echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
+sleep \$RETRY_DELAY
+else
+echo "❌ Health check failed after \$MAX_RETRIES attempts"
+exit 1
+fi
+done
 
-            echo "📊 Checking service status..."
-            sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
+echo "📊 Checking service status..."
+sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
 
-            echo "✅ Redeploy complete!"
-            EOF
+echo "✅ Deployment complete!"
+EOF
+            }
 
-          # ============================================================
-          # ROLLBACK OPERATION
-          # ============================================================
-          elif [ "$ACTION" = "rollback" ]; then
-            echo "⏪ Performing rollback operation..."
+            # Execute deployment
+            deploy_to_sha
 
-            if [ -z "$FINAL_SHA" ]; then
-              echo "❌ ERROR: Cannot rollback without target SHA"
-              exit 1
-            fi
-
-            echo "🎯 Rollback target SHA: ${FINAL_SHA}"
-
-            # Validate SHA format before SSH
-            if ! [[ "${FINAL_SHA}" =~ ^[a-f0-9]{40}$ ]]; then
-              echo "❌ ERROR: Invalid SHA format: ${FINAL_SHA}"
-              exit 1
-            fi
-
-            # SSH into VM and rollback
-            ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_HOST} "bash -s" << EOF
-            set -euo pipefail
-
-            cd ${VM_APP_PATH}
-
-            echo "🔧 Configuring git safe directory..."
-            git config --global --add safe.directory ${VM_APP_PATH}
-
-            echo "📥 Fetching latest code from origin..."
-            git fetch origin
-
-            echo "🧹 Cleaning working directory..."
-            git reset --hard
-            git clean -fd
-
-            echo "📍 Checking out commit SHA: ${FINAL_SHA}"
-            git checkout ${FINAL_SHA}
-
-            echo "🔄 Restarting service..."
-            sudo systemctl restart ${VM_SERVICE_NAME}
-
-            echo "⏳ Waiting for service to initialize..."
-            sleep 3
-
-            echo "🏥 Checking health endpoint..."
-            MAX_RETRIES=10
-            RETRY_DELAY=2
-            RETRY_COUNT=0
-
-            while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
-              if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
-                echo "✅ Health check passed"
-                break
-              fi
-              RETRY_COUNT=\$((RETRY_COUNT + 1))
-              if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
-                echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-                sleep \$RETRY_DELAY
-              else
-                echo "❌ Health check failed after \$MAX_RETRIES attempts"
-                exit 1
-              fi
-            done
-
-            echo "📊 Checking service status..."
-            sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
-
-            echo "✅ Rollback complete!"
-            EOF
+            echo "✅ ${ACTION^} completed successfully"
+            echo "📍 SHA: ${FINAL_SHA}"
+            echo "🖥️  VM: ${VM_HOST}"
           fi
 
           # Set outputs
