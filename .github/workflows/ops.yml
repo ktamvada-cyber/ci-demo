@@ -1114,11 +1114,15 @@ jobs:
             echo "♻️  Performing restart operation..."
 
             # SSH into VM and restart service
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
+            # Pass environment variables explicitly to avoid variable expansion issues
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              ${VM_USER}@${VM_HOST} \
+              VM_SERVICE_NAME="${VM_SERVICE_NAME}" \
+              "bash -s" <<-'REMOTE_SCRIPT'
             set -euo pipefail
 
             echo "🔄 Restarting service..."
-            sudo systemctl restart ${VM_SERVICE_NAME}
+            sudo systemctl restart "$VM_SERVICE_NAME"
 
             echo "⏳ Waiting for service to initialize..."
             sleep 3
@@ -1128,23 +1132,23 @@ jobs:
             RETRY_DELAY=2
             RETRY_COUNT=0
 
-            while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
               if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
                 echo "✅ Health check passed"
                 break
               fi
-              RETRY_COUNT=\$((RETRY_COUNT + 1))
-              if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
-                echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-                sleep \$RETRY_DELAY
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⏳ Health check attempt $RETRY_COUNT/$MAX_RETRIES failed, retrying in ${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
               else
-                echo "❌ Health check failed after \$MAX_RETRIES attempts"
+                echo "❌ Health check failed after $MAX_RETRIES attempts"
                 exit 1
               fi
             done
 
             echo "✅ Restart complete!"
-            EOF
+REMOTE_SCRIPT
 
           # ============================================================
           # REDEPLOY & ROLLBACK OPERATIONS
@@ -1174,14 +1178,20 @@ jobs:
             fi
 
             # SSH into VM and deploy
+            # Pass environment variables explicitly to avoid variable expansion issues
             echo "🔐 Connecting to VM via SSH..."
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              ${VM_USER}@${VM_HOST} \
+              VM_APP_PATH="${VM_APP_PATH}" \
+              FINAL_SHA="${FINAL_SHA}" \
+              VM_SERVICE_NAME="${VM_SERVICE_NAME}" \
+              "bash -s" <<-'REMOTE_SCRIPT'
             set -euo pipefail
 
-            cd ${VM_APP_PATH}
+            cd "$VM_APP_PATH"
 
             echo "🔧 Configuring git safe directory..."
-            git config --global --add safe.directory ${VM_APP_PATH}
+            git config --global --add safe.directory "$VM_APP_PATH"
 
             echo "📥 Fetching latest code from origin..."
             git fetch --prune --tags origin
@@ -1190,11 +1200,15 @@ jobs:
             git reset --hard
             git clean -fd
 
-            echo "📍 Checking out commit SHA: ${FINAL_SHA}"
-            git checkout ${FINAL_SHA}
+            echo "📍 Checking out commit SHA: $FINAL_SHA"
+            git checkout "$FINAL_SHA"
+
+            echo "✅ Verifying checkout succeeded..."
+            DEPLOYED_SHA=$(git rev-parse HEAD)
+            echo "Deployed SHA: $DEPLOYED_SHA"
 
             echo "🔄 Restarting service..."
-            sudo systemctl restart ${VM_SERVICE_NAME}
+            sudo systemctl restart "$VM_SERVICE_NAME"
 
             echo "⏳ Waiting for service to initialize..."
             sleep 3
@@ -1204,23 +1218,23 @@ jobs:
             RETRY_DELAY=2
             RETRY_COUNT=0
 
-            while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
               if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
                 echo "✅ Health check passed"
                 break
               fi
-              RETRY_COUNT=\$((RETRY_COUNT + 1))
-              if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
-                echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-                sleep \$RETRY_DELAY
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⏳ Health check attempt $RETRY_COUNT/$MAX_RETRIES failed, retrying in ${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
               else
-                echo "❌ Health check failed after \$MAX_RETRIES attempts"
+                echo "❌ Health check failed after $MAX_RETRIES attempts"
                 exit 1
               fi
             done
 
             echo "✅ Deployment complete!"
-            EOF
+REMOTE_SCRIPT
 
             echo "✅ ${ACTION^} completed successfully"
             echo "📍 SHA: ${FINAL_SHA}"
