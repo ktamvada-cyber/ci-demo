@@ -471,6 +471,27 @@ jobs:
           # Full 40-character commit SHA (already provided by validation step)
           echo "✅ Full Commit SHA: ${{ steps.validate.outputs.pr_sha }}"
 
+      # STEP 4.5: Setup SSH Key for VM Access
+      # Configure SSH authentication to connect to the VM
+      # SECURITY: SSH private key stored as GitHub secret
+      - name: Setup SSH Key for VM Access
+        if: steps.validate.outputs.should_deploy == 'true'
+        run: |
+          echo "🔐 Configuring SSH authentication..."
+
+          # Create .ssh directory with correct permissions
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Install SSH private key from secrets
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # Add VM host to known_hosts to avoid host verification prompt
+          ssh-keyscan -H ${{ env.VM_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+          echo "✅ SSH key configured for ${VM_USER}@${VM_HOST}"
+
       # STEP 5: Check if same version is already deployed
       # Skip deployment if the exact same SHA is already deployed on VM
       # Prevents unnecessary downtime and service restarts
@@ -485,7 +506,7 @@ jobs:
 
           # SSH into VM and check currently deployed SHA
           CURRENT_SHA=$(ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_HOST} \
-            "cd ${VM_APP_PATH} && git rev-parse HEAD" 2>/dev/null || echo "unknown")
+            "git config --global --add safe.directory ${VM_APP_PATH} 2>/dev/null || true; cd ${VM_APP_PATH} && git rev-parse HEAD" 2>/dev/null || echo "unknown")
 
           echo "📍 Current SHA: ${CURRENT_SHA}"
           echo "📍 Target SHA:  ${COMMIT_SHA}"
@@ -573,6 +594,9 @@ jobs:
           set -euo pipefail
 
           cd ${VM_APP_PATH}
+
+          echo "🔧 Configuring git safe directory..."
+          git config --global --add safe.directory ${VM_APP_PATH}
 
           echo "📥 Fetching latest code from origin..."
           git fetch origin
@@ -740,6 +764,9 @@ jobs:
           set -euo pipefail
 
           cd ${VM_APP_PATH}
+
+          echo "🔧 Configuring git safe directory..."
+          git config --global --add safe.directory ${VM_APP_PATH}
 
           echo "📥 Fetching latest code from origin..."
           git fetch origin
