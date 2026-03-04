@@ -7,8 +7,8 @@ app = FastAPI()
 @app.get("/")
 def read_root():
     return {
-        "message": "Hello from Feature 1",
-        "version": "2.0",
+        "message": "Hello from Feature 1 - Updated",
+        "version": "2.1",
         "commit": os.getenv("COMMIT_SHA", "unknown"),
         "environment": os.getenv("ENVIRONMENT", "unknown")
     }
