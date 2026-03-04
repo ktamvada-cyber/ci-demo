@@ -526,9 +526,9 @@ jobs:
             echo "🔄 Different version detected - proceeding with deployment"
           fi
 
-      # STEP 6: Post already-deployed notification
-      # Informs user that deployment was skipped because same version is running
-      - name: Post Already Deployed Status
+      # STEP 6: Post redeployment notification (when same SHA is already deployed)
+      # Informs user that same version will be redeployed with service restart
+      - name: Post Redeployment Notice
         if: steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed == 'true'
         uses: actions/github-script@v7
         with:
@@ -540,27 +540,27 @@ jobs:
             const vmHost = process.env.VM_HOST;
             const vmAppPath = process.env.VM_APP_PATH;
 
-            const comment = `### ℹ️ Deployment Skipped (Already Running)
+            const comment = `### 🔄 Redeploying Same Version
 
-            #### 📋 Current Deployment
+            #### 📋 Deployment Info
             | Field | Value |
             |-------|-------|
             | **Environment** | \`${environment}\` |
-            | **Status** | Already Deployed |
+            | **Status** | Redeploying + Restarting Service |
             | **Commit SHA** | \`${sha}\` |
-            | **Check Timestamp** | \`${buildTimestamp}\` |
-            | **Check ID** | \`${deploymentId}\` |
+            | **Timestamp** | \`${buildTimestamp}\` |
+            | **Deployment ID** | \`${deploymentId}\` |
             | **VM Host** | \`${vmHost}\` |
             | **App Path** | \`${vmAppPath}\` |
 
             ---
-            ✅ This exact version is already deployed in ${environment}.
+            ℹ️ Same commit SHA detected on VM, but proceeding with full deployment to ensure service is restarted with latest code.
 
             #### 🌐 Access Information
             **VM:** ${vmHost}
             **Workflow Run:** [View Logs](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
 
-            💡 **Note:** No deployment needed - skipping to avoid unnecessary service restart.
+            ⚙️ **Action:** Redeploying and restarting \`${process.env.VM_SERVICE_NAME}\` service.
             `;
 
             await github.rest.issues.createComment({
@@ -575,7 +575,7 @@ jobs:
       # SECURITY: Deployment uses exact validated SHA - never branch names
       - name: Deploy to Staging
         id: deploy_staging
-        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'staging' && steps.check_deployed.outputs.already_deployed != 'true'
+        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'staging'
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
           ENVIRONMENT: staging
@@ -751,7 +751,7 @@ jobs:
       # Production uses the same code tested in staging
       - name: Deploy to Production
         id: deploy_production
-        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production' && steps.check_deployed.outputs.already_deployed != 'true'
+        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production'
         env:
           COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
           ENVIRONMENT: production
