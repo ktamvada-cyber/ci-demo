@@ -1143,9 +1143,6 @@ jobs:
               fi
             done
 
-            echo "📊 Checking service status..."
-            sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
-
             echo "✅ Restart complete!"
             EOF
 
@@ -1221,9 +1218,6 @@ jobs:
                 exit 1
               fi
             done
-
-            echo "📊 Checking service status..."
-            sudo systemctl is-active --quiet ${VM_SERVICE_NAME}
 
             echo "✅ Deployment complete!"
             EOF
