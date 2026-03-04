@@ -104,12 +104,37 @@ jobs:
             }
             core.info(`✅ Authorization check passed: ${commenter} is authorized for ${environment} deployment`);
 
-            // Get PR details
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number
-            });
+            // Get PR details with retry logic for GitHub async mergeability calculation
+            let pr;
+            const maxRetries = 10;
+            const retryDelay = 5000;
+
+            for (let attempt = 0; attempt < maxRetries; attempt++) {
+              const { data: prData } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number
+              });
+
+              pr = prData;
+
+              core.info(
+                `🔍 Attempt ${attempt + 1}/${maxRetries}: mergeable=${pr.mergeable}, mergeable_state="${pr.mergeable_state}"`
+              );
+
+              // Stop polling when GitHub finishes computing mergeability
+              if (pr.mergeable !== null && pr.mergeable_state !== "unknown") {
+                core.info(
+                  `✅ Mergeability resolved: mergeable=${pr.mergeable}, state="${pr.mergeable_state}"`
+                );
+                break;
+              }
+
+              if (attempt < maxRetries - 1) {
+                core.info(`⏳ GitHub still computing mergeability. Retrying in ${retryDelay / 1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+              }
+            }
 
             // SECURITY CHECK 2: Verify PR is OPEN
             // Prevents deployment of closed or merged PRs
@@ -121,11 +146,12 @@ jobs:
             }
             core.info(`✅ PR state check passed: PR is open`);
 
-            // SECURITY CHECK 3: Verify mergeable_state is "clean"
-            // Prevents deployment if PR has conflicts, is blocked, behind, or in unknown state
-            // "clean" means: all required checks passed, no conflicts, ready to merge
-            if (pr.mergeable_state !== 'clean') {
-              // Check if the issue is a failing test-coverage check
+            // SECURITY CHECK 3: Verify PR is mergeable and state is "clean"
+            // Prevents deployment if PR has conflicts, is blocked, behind, or failing checks
+            // mergeable=true: No merge conflicts
+            // mergeable_state="clean": All required checks passed, no conflicts, ready to merge
+            if (pr.mergeable !== true || pr.mergeable_state !== "clean") {
+              // Check if the issue is a failing test-coverage check for better error message
               const prSha = pr.head.sha;
               let coverageErrorMsg = null;
 
@@ -169,22 +195,14 @@ jobs:
                 core.info(`Could not check coverage status: ${error.message}`);
               }
 
-              const errorMsg = coverageErrorMsg || `❌ VALIDATION FAILED: PR #${context.issue.number} mergeable_state is "${pr.mergeable_state}". Required: "clean". This PR may have conflicts, required checks failing, or be behind the base branch.`;
-              core.setOutput('error_message', errorMsg);
-              core.setFailed(errorMsg);
-              return { shouldDeploy: false };
-            }
-            core.info(`✅ Mergeable state check passed: ${pr.mergeable_state}`);
+              const errorMsg = coverageErrorMsg ||
+                `❌ VALIDATION FAILED: PR #${context.issue.number} mergeable=${pr.mergeable}, state="${pr.mergeable_state}". Required: mergeable=true and state="clean".`;
 
-            // SECURITY CHECK 4: Explicit check for merge conflicts
-            // Double verification that no conflicts exist
-            if (pr.mergeable === false) {
-              const errorMsg = `❌ VALIDATION FAILED: PR #${context.issue.number} has merge conflicts. Resolve conflicts before deploying.`;
               core.setOutput('error_message', errorMsg);
               core.setFailed(errorMsg);
               return { shouldDeploy: false };
             }
-            core.info(`✅ Merge conflicts check passed: No conflicts detected`);
+            core.info(`✅ Mergeability check passed: mergeable=${pr.mergeable}, state="${pr.mergeable_state}"`);
 
             // SHA-BASED DEPLOYMENT SECURITY:
             // Extract exact commit SHA from PR HEAD and deploy ONLY that specific commit.
