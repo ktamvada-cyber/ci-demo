@@ -1086,9 +1086,9 @@ jobs:
           API_KEY: ${{ secrets.API_KEY }}
           DB_HOST: ${{ secrets.DB_HOST }}
         run: |
-          echo "🚀 Executing ops operation: ${ACTION} on ${ENVIRONMENT}"
-          echo "🖥️  VM Host: ${VM_HOST}"
-          echo "📁 App Path: ${VM_APP_PATH}"
+          echo "Executing ops operation: ${ACTION} on ${ENVIRONMENT}"
+          echo "VM Host: ${VM_HOST}"
+          echo "App Path: ${VM_APP_PATH}"
 
           # ============================================================
           # RESTART OPERATION
