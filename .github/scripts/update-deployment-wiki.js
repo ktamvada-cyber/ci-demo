@@ -59,8 +59,10 @@ module.exports = async ({ github, context, core }) => {
             (a, b) => new Date(b.created_at) - new Date(a.created_at)
           )[0];
 
-          // Only include successful deployments
-          if (latestStatus && latestStatus.state === 'success') {
+          // Check if deployment ever reached 'success' state (before possibly becoming 'inactive')
+          const hasSuccessState = statuses.some(s => s.state === 'success');
+
+          if (latestStatus && hasSuccessState) {
             successfulDeployments.push({
               deployment,
               status: latestStatus
