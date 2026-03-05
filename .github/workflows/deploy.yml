@@ -1,6 +1,5 @@
 name: Deploy on Comment
 
-# Workflow for deploying to staging and production environments via PR comments
 # SECURITY ARCHITECTURE:
 # This workflow uses issue_comment trigger which ALWAYS runs from the default branch (main).
 # This prevents attackers from modifying the workflow in feature branches to bypass security checks.
