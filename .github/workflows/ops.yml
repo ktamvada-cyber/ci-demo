@@ -53,15 +53,11 @@ env:
   # TODO: Create a pinned "Ops Console" issue and set the number here
   OPS_ISSUE_NUMBER: 2
 
-  # Deployment configuration constants
-  STAGING_PORT: 8001
-  PROD_PORT: 8002
-  STAGING_CONTAINER: myapp-staging
-  PROD_CONTAINER: myapp-prod
-  IMAGE_NAME: ci-demo
-  CONTAINER_INTERNAL_PORT: 8000
-  HEALTH_CHECK_MAX_RETRIES: 10
-  HEALTH_CHECK_RETRY_SLEEP: 2
+  # VM SSH configuration
+  VM_HOST: 192.168.64.2
+  VM_USER: deploy
+  VM_APP_PATH: /var/www/voicemodal
+  VM_SERVICE_NAME: convirza-voiceagent
 
 # Explicit permissions following principle of least privilege
 # This workflow can only read code and write to issues/deployments - cannot push code or modify settings
@@ -74,13 +70,17 @@ permissions:
 
 # Concurrency control: Only ONE ops operation at a time across all environments
 # Cancel any in-progress ops action when a new one is triggered
-# Prevents race conditions and ensures clean container state
+# Prevents race conditions and ensures clean deployment state
 concurrency:
   group: ops
   cancel-in-progress: true
 
 jobs:
   ops:
+    # Security: Only run on non-PR issues (ops console) or manual workflow_dispatch
+    # This prevents ops workflow from triggering on PR comments (those should use deploy.yml)
+    # For issue comments, ONLY run on the designated Ops Console issue (#2)
+    if: github.event_name == 'workflow_dispatch' || (github.event.issue.pull_request == null && github.event.issue.number == 2)
     runs-on: self-hosted
 
     # GitHub Environment protection (requires manual approval for production if configured)
@@ -88,7 +88,7 @@ jobs:
     # Strict matching: [prod-restart], [prod-redeploy...], [prod-rollback...]
     environment:
       name: ${{ github.event.inputs.environment || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')) && 'production' || 'staging') }}
-      url: ${{ (github.event.inputs.environment == 'production' || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')))) && 'http://localhost:8002' || 'http://localhost:8001' }}
+      url: ${{ (github.event.inputs.environment == 'production' || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')))) && 'http://192.168.64.2/production' || 'http://192.168.64.2/staging' }}
 
     # Prevent runaway operations - fail if job exceeds 15 minutes
     timeout-minutes: 15
@@ -282,10 +282,6 @@ jobs:
               core.info(`✅ Rollback target validated`);
             }
 
-            // Determine container and port from workflow env constants
-            const containerName = environment === 'staging' ? process.env.STAGING_CONTAINER : process.env.PROD_CONTAINER;
-            const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
-
             // Set outputs
             core.setOutput('should_run', 'true');
             core.setOutput('action', action);
@@ -293,8 +289,6 @@ jobs:
             core.setOutput('target_sha', targetSha);
             core.setOutput('steps', steps);
             core.setOutput('confirm', confirm);
-            core.setOutput('container_name', containerName);
-            core.setOutput('port', port);
             core.setOutput('requester', requester);
             core.setOutput('skip_tagging', 'true');  // Ops workflow never tags
 
@@ -303,9 +297,7 @@ jobs:
             return {
               shouldRun: true,
               action,
-              environment,
-              containerName,
-              port
+              environment
             };
 
       # STEP 2: Post validation failure message
@@ -520,38 +512,31 @@ jobs:
               body: comment
             });
 
-      # STEP 3: Determine current SHA from running container
-      # Extract current SHA and image reference for rollback calculations
+      # STEP 3: Determine current SHA from VM deployment
+      # Query VM to get currently deployed commit SHA
       - name: Determine Current SHA
         id: determine_current
         if: steps.validate.outputs.should_run == 'true'
         env:
-          CONTAINER_NAME: ${{ steps.validate.outputs.container_name }}
+          ENVIRONMENT: ${{ steps.validate.outputs.environment }}
         run: |
-          echo "🔍 Determining current state..."
+          set -euo pipefail
 
-          CURRENT_SHA=""
-          CURRENT_IMAGE=""
+          echo "🔍 Determining current deployment state on VM..."
 
-          # Try to get current SHA from running container
-          if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            CURRENT_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME} 2>/dev/null || echo "")
-            echo "📦 Current image: ${CURRENT_IMAGE}"
+          # SSH into VM and get current SHA
+          CURRENT_SHA=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+            "git -C ${VM_APP_PATH} rev-parse HEAD 2>/dev/null || echo unknown" 2>/dev/null || echo "")
 
-            # Extract SHA from image tag (${IMAGE_NAME}:<sha>)
-            if [[ "$CURRENT_IMAGE" =~ ${IMAGE_NAME}:([a-f0-9]{40}) ]]; then
-              CURRENT_SHA="${BASH_REMATCH[1]}"
-              echo "📍 Current SHA: ${CURRENT_SHA}"
-            else
-              echo "⚠️  Could not extract SHA from current image tag"
-            fi
+          if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" != "unknown" ]; then
+            echo "📍 Current SHA: ${CURRENT_SHA}"
           else
-            echo "ℹ️  No container currently running"
+            echo "⚠️  Could not determine current SHA from VM"
+            CURRENT_SHA=""
           fi
 
           # Output results
           echo "current_sha=${CURRENT_SHA}" >> $GITHUB_OUTPUT
-          echo "current_image=${CURRENT_IMAGE}" >> $GITHUB_OUTPUT
 
       # STEP 4: Compute Rollback Target (GitHub Deployments API)
       # PRIMARY source of truth for rollback-by-steps
@@ -714,60 +699,51 @@ jobs:
             }
 
       # STEP 5: Determine target SHA for operation
-      # For restart: infer SHA from running container
-      # For redeploy: use resolved SHA (from tag/ref) or infer from running container
-      # For rollback: use resolved SHA (from tag/ref), API result, or local history fallback
+      # For restart: uses current deployment SHA
+      # For redeploy: use resolved SHA (from tag/ref)
+      # For rollback: use resolved SHA (from tag/ref) or GitHub Deployments API result
       - name: Determine Target SHA
         id: determine_sha
         if: steps.validate.outputs.should_run == 'true'
         env:
           ACTION: ${{ steps.validate.outputs.action }}
           ENVIRONMENT: ${{ steps.validate.outputs.environment }}
-          CONTAINER_NAME: ${{ steps.validate.outputs.container_name }}
           TARGET_SHA: ${{ steps.resolve_sha.outputs.resolved_sha || steps.validate.outputs.target_sha }}
           ORIGINAL_REF: ${{ steps.resolve_sha.outputs.original_ref || steps.validate.outputs.target_sha }}
           STEPS: ${{ steps.validate.outputs.steps }}
           CURRENT_SHA: ${{ steps.determine_current.outputs.current_sha }}
-          CURRENT_IMAGE: ${{ steps.determine_current.outputs.current_image }}
           API_TARGET_SHA: ${{ steps.compute_rollback_api.outputs.api_target_sha }}
           USED_API: ${{ steps.compute_rollback_api.outputs.used_api }}
         run: |
+          set -euo pipefail
+
           echo "🔍 Determining target SHA for ${ACTION}..."
 
           FINAL_SHA=""
-          FINAL_IMAGE_REF=""
 
           if [ "$ACTION" = "restart" ]; then
             # For restart, we use current SHA (if available) but don't require it
             FINAL_SHA="${CURRENT_SHA}"
-            FINAL_IMAGE_REF="${CURRENT_IMAGE}"
-            echo "♻️  Restart operation: using current SHA/image"
+            echo "♻️  Restart operation: using current SHA"
 
           elif [ "$ACTION" = "redeploy" ]; then
-            # For redeploy, use provided SHA or current SHA/image
+            # For redeploy, use provided SHA (required)
             if [ -n "$TARGET_SHA" ]; then
               FINAL_SHA="$TARGET_SHA"
-              FINAL_IMAGE_REF="${IMAGE_NAME}:${FINAL_SHA}"
               if [ -n "$ORIGINAL_REF" ] && [ "$ORIGINAL_REF" != "$TARGET_SHA" ]; then
                 echo "🎯 Redeploy with SHA from ${ORIGINAL_REF}: ${FINAL_SHA}"
               else
                 echo "🎯 Redeploy with provided SHA: ${FINAL_SHA}"
               fi
             else
-              # Use current container's image (allow redeploy from inferred image)
-              if [ -z "$CURRENT_IMAGE" ]; then
-                echo "❌ ERROR: Cannot redeploy without target SHA when no container is running"
-                echo "   Please provide sha=<sha|tag|ref> or ensure a container is currently running"
-                echo "   Examples: sha=abc123...def, sha=v1.2.3, sha=main"
-                exit 1
-              fi
-              FINAL_SHA="${CURRENT_SHA}"
-              FINAL_IMAGE_REF="${CURRENT_IMAGE}"
-              echo "🔄 Redeploy with current SHA/image: ${FINAL_SHA:-'(from image)'}"
+              echo "❌ ERROR: Cannot redeploy without target SHA"
+              echo "   Please provide sha=<sha|tag|ref>"
+              echo "   Examples: sha=abc123...def, sha=v1.2.3, sha=main"
+              exit 1
             fi
 
           elif [ "$ACTION" = "rollback" ]; then
-            # For rollback, prioritize: provided SHA (resolved from tag/ref) > API result > local history
+            # For rollback, prioritize: provided SHA (resolved from tag/ref) > GitHub Deployments API result
             if [ -n "$TARGET_SHA" ]; then
               FINAL_SHA="$TARGET_SHA"
               if [ -n "$ORIGINAL_REF" ] && [ "$ORIGINAL_REF" != "$TARGET_SHA" ]; then
@@ -777,124 +753,30 @@ jobs:
               fi
 
             elif [ "$USED_API" = "true" ] && [ -n "$API_TARGET_SHA" ]; then
-              # Use API result (PRIMARY source of truth)
+              # Use GitHub Deployments API result (PRIMARY source of truth)
               FINAL_SHA="$API_TARGET_SHA"
               echo "✅ Rollback target from GitHub Deployments API: ${FINAL_SHA}"
 
             else
-              # Fallback to local history file
-              echo "📚 Calculating rollback target from local history (${STEPS} step(s) back)..."
-
-              HISTORY_FILE="/tmp/myapp-${ENVIRONMENT}.history"
-
-              if [ -f "$HISTORY_FILE" ]; then
-                echo "📁 Using local history fallback: ${HISTORY_FILE}"
-
-                # Extract all SHAs from history (in chronological order, newest at bottom)
-                # Filter to only lines with ' sha=' to exclude restart-only entries
-                HISTORY_SHAS=$(grep -o ' sha=[a-f0-9]\{40\}' "$HISTORY_FILE" | cut -d= -f2)
-
-                if [ -z "$HISTORY_SHAS" ]; then
-                  echo "❌ ERROR: No SHA-based deployments in local history"
-                  exit 1
-                fi
-
-                # Count total SHA entries
-                SHA_COUNT=$(echo "$HISTORY_SHAS" | wc -l | tr -d ' ')
-                echo "ℹ️  Found ${SHA_COUNT} SHA-based deployments in local history"
-
-                HISTORY_SHA=""
-
-                if [ -n "$CURRENT_SHA" ]; then
-                  # Find current SHA position in reversed list (newest first, 1-indexed)
-                  CURRENT_INDEX=$(echo "$HISTORY_SHAS" | tac | grep -n "^${CURRENT_SHA}$" | tail -1 | cut -d: -f1 || echo "0")
-
-                  if [ "$CURRENT_INDEX" -gt 0 ]; then
-                    # Found current SHA. Target is STEPS further back
-                    # Array is newest-first: [current, previous, 2-back, ...]
-                    # steps=1 → previous (current+1), steps=2 → 2-back (current+2)
-                    TARGET_INDEX=$((CURRENT_INDEX + STEPS))
-
-                    # Bounds check
-                    if [ "$TARGET_INDEX" -le "$SHA_COUNT" ]; then
-                      # Extract SHA at target index (from reversed list)
-                      HISTORY_SHA=$(echo "$HISTORY_SHAS" | tac | sed -n "${TARGET_INDEX}p")
-                      echo "ℹ️  Current SHA at position ${CURRENT_INDEX}, target at position ${TARGET_INDEX}"
-                    else
-                      echo "❌ ERROR: Target position ${TARGET_INDEX} exceeds history (${SHA_COUNT} entries)"
-                      echo "   Cannot rollback ${STEPS} step(s) from current position ${CURRENT_INDEX}"
-                      exit 1
-                    fi
-                  else
-                    # Current SHA not in history - use newest deployment as baseline (index 1)
-                    # Then apply steps from that baseline: target = 1 + steps
-                    # steps=1 → index 2 (previous from baseline), steps=2 → index 3 (2-back from baseline)
-                    TARGET_INDEX=$((1 + STEPS))
-
-                    echo "ℹ️  Current SHA not in history; using newest deployment (index 1) as baseline"
-
-                    # Bounds check
-                    if [ "$TARGET_INDEX" -le "$SHA_COUNT" ]; then
-                      HISTORY_SHA=$(echo "$HISTORY_SHAS" | tac | sed -n "${TARGET_INDEX}p")
-                      echo "ℹ️  Baseline at position 1, target at position ${TARGET_INDEX}"
-                    else
-                      echo "❌ ERROR: Not enough SHA deployments in history to rollback ${STEPS} step(s)"
-                      echo "   Need at least $((STEPS + 1)) entries, found ${SHA_COUNT}"
-                      exit 1
-                    fi
-                  fi
-                else
-                  # No current SHA - use newest deployment as baseline (index 1)
-                  # Then apply steps from that baseline: target = 1 + steps
-                  # steps=1 → index 2 (previous from baseline), steps=2 → index 3 (2-back from baseline)
-                  TARGET_INDEX=$((1 + STEPS))
-
-                  echo "ℹ️  No current SHA; using newest deployment (index 1) as baseline"
-
-                  # Bounds check
-                  if [ "$TARGET_INDEX" -le "$SHA_COUNT" ]; then
-                    HISTORY_SHA=$(echo "$HISTORY_SHAS" | tac | sed -n "${TARGET_INDEX}p")
-                    echo "ℹ️  Baseline at position 1, target at position ${TARGET_INDEX}"
-                  else
-                    echo "❌ ERROR: Not enough SHA deployments in history to rollback ${STEPS} step(s)"
-                    echo "   Need at least $((STEPS + 1)) entries, found ${SHA_COUNT}"
-                    exit 1
-                  fi
-                fi
-
-                if [ -n "$HISTORY_SHA" ]; then
-                  FINAL_SHA="$HISTORY_SHA"
-                  echo "✅ Rollback target from local history: ${FINAL_SHA}"
-                else
-                  echo "❌ ERROR: Could not determine rollback target from local history"
-                  echo "   Current SHA: ${CURRENT_SHA}"
-                  echo "   Steps: ${STEPS}"
-                  echo "   SHA-based entries in history: ${SHA_COUNT}"
-                  exit 1
-                fi
-              else
-                echo "❌ ERROR: No deployment history available"
-                echo "   GitHub Deployments API: insufficient data"
-                echo "   Local history file not found: ${HISTORY_FILE}"
-                echo "   Cannot calculate rollback target for steps=${STEPS}"
-                exit 1
-              fi
+              # If GitHub Deployments API doesn't have enough data, fail
+              echo "❌ ERROR: No deployment history available"
+              echo "   GitHub Deployments API: insufficient data for rollback"
+              echo "   Cannot calculate rollback target for steps=${STEPS}"
+              echo "   Please use an explicit SHA instead of steps for rollback"
+              exit 1
             fi
-
-            FINAL_IMAGE_REF="${IMAGE_NAME}:${FINAL_SHA}"
           fi
 
-          # Validate final SHA or image
-          if [ -z "$FINAL_SHA" ] && [ -z "$FINAL_IMAGE_REF" ] && [ "$ACTION" != "restart" ]; then
-            echo "❌ ERROR: Could not determine target SHA or image for ${ACTION}"
+          # Validate final SHA (not required for restart)
+          if [ -z "$FINAL_SHA" ] && [ "$ACTION" != "restart" ]; then
+            echo "❌ ERROR: Could not determine target SHA for ${ACTION}"
             exit 1
           fi
 
           # Output results
           echo "final_sha=${FINAL_SHA}" >> $GITHUB_OUTPUT
-          echo "final_image_ref=${FINAL_IMAGE_REF}" >> $GITHUB_OUTPUT
 
-          echo "✅ Target determined: SHA=${FINAL_SHA:-'(from image)'} Image=${FINAL_IMAGE_REF:-'N/A'}"
+          echo "✅ Target determined: SHA=${FINAL_SHA:-'current'}"
 
       # STEP 5.5: Verify Coverage Gate Passed
       # COVERAGE GATE: Block redeploy/rollback if coverage check missing or failed
@@ -1180,28 +1062,50 @@ jobs:
               log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             });
 
+      # STEP 6.5: Setup SSH Key for VM Access
+      # Configure SSH authentication to connect to the VM
+      # SECURITY: SSH private key stored as GitHub secret
+      - name: Setup SSH Key for VM Access
+        if: steps.validate.outputs.should_run == 'true'
+        run: |
+          set -euo pipefail
+
+          echo "🔐 Configuring SSH authentication..."
+
+          # Create .ssh directory with correct permissions
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Install SSH private key from secrets
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # Add VM host to known_hosts to avoid host verification prompt
+          ssh-keyscan -H ${{ env.VM_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+          echo "✅ SSH key configured for ${VM_USER}@${VM_HOST}"
+
       # STEP 7: Execute ops operation
-      # Performs restart, redeploy, or rollback based on action
+      # Performs restart, redeploy, or rollback via SSH on VM
       - name: Execute Ops Operation
         id: execute_ops
         if: steps.validate.outputs.should_run == 'true'
         env:
           ACTION: ${{ steps.validate.outputs.action }}
           ENVIRONMENT: ${{ steps.validate.outputs.environment }}
-          CONTAINER_NAME: ${{ steps.validate.outputs.container_name }}
-          PORT: ${{ steps.validate.outputs.port }}
           FINAL_SHA: ${{ steps.determine_sha.outputs.final_sha }}
-          FINAL_IMAGE_REF: ${{ steps.determine_sha.outputs.final_image_ref }}
           API_KEY: ${{ secrets.API_KEY }}
           DB_HOST: ${{ secrets.DB_HOST }}
         run: |
-          echo "🚀 Executing ops operation: ${ACTION} on ${ENVIRONMENT}"
-          echo "📦 Container: ${CONTAINER_NAME}"
-          echo "🔌 Port: ${PORT}"
+          set -euo pipefail
 
-          HEALTH_STATUS="unknown"
-          IMAGE_DIGEST=""
-          ACTUAL_IMAGE=""
+          echo "Runner: $(hostname)"
+          echo "GitHub Run ID: ${{ github.run_id }}"
+          echo "VM: ${VM_HOST}"
+          echo ""
+          echo "Executing ops operation: ${ACTION} on ${ENVIRONMENT}"
+          echo "VM Host: ${VM_HOST}"
+          echo "App Path: ${VM_APP_PATH}"
 
           # ============================================================
           # RESTART OPERATION
@@ -1209,218 +1113,167 @@ jobs:
           if [ "$ACTION" = "restart" ]; then
             echo "♻️  Performing restart operation..."
 
-            # Check if container exists
-            if ! docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "❌ ERROR: Container ${CONTAINER_NAME} does not exist"
-              exit 1
-            fi
+            # SSH into VM and restart service
+            # Pass environment variables explicitly to avoid variable expansion issues
+            cat <<'SCRIPT_EOF' | ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+              VM_SERVICE_NAME="${VM_SERVICE_NAME}" \
+              VM_APP_PATH="${VM_APP_PATH}" \
+              ENVIRONMENT="${ENVIRONMENT}" \
+              DEPLOYMENT_ID="${{ github.run_id }}" \
+              API_KEY="${API_KEY}" \
+              DB_HOST="${DB_HOST}" \
+              bash -s
+            set -euo pipefail
 
-            # Restart container
-            echo "🔄 Restarting container: ${CONTAINER_NAME}"
-            docker restart ${CONTAINER_NAME}
+            echo "📝 Writing environment variables..."
+            cat > "$VM_APP_PATH/.env" <<ENV_EOF
+          ENVIRONMENT=$ENVIRONMENT
+          DEPLOYMENT_ID=$DEPLOYMENT_ID
+          API_KEY=$API_KEY
+          DB_HOST=$DB_HOST
+          PORT=8000
+          COMMIT_SHA=$(cd "$VM_APP_PATH" && git rev-parse HEAD 2>/dev/null || echo "unknown")
+          ENV_EOF
 
-            # Wait for startup
-            echo "⏳ Waiting for service to start..."
-            sleep 5
+            echo "🔄 Restarting service..."
+            sudo systemctl restart "$VM_SERVICE_NAME"
 
-            # Get actual image and digest
-            ACTUAL_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME} 2>/dev/null || echo "")
-            IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${CONTAINER_NAME} 2>/dev/null || echo "")
-            if [ -z "$IMAGE_DIGEST" ]; then
-              IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${CONTAINER_NAME})
-            fi
+            echo "⏳ Waiting for service to initialize..."
+            sleep 3
 
-          # ============================================================
-          # REDEPLOY OPERATION
-          # ============================================================
-          elif [ "$ACTION" = "redeploy" ]; then
-            echo "🔄 Performing redeploy operation..."
+            echo "🏥 Checking health endpoint..."
+            MAX_RETRIES=10
+            RETRY_DELAY=2
+            RETRY_COUNT=0
 
-            # Determine image to redeploy
-            if [ -n "$FINAL_IMAGE_REF" ]; then
-              TARGET_IMAGE="$FINAL_IMAGE_REF"
-            elif [ -n "$FINAL_SHA" ]; then
-              TARGET_IMAGE="${IMAGE_NAME}:${FINAL_SHA}"
-            else
-              echo "❌ ERROR: Cannot redeploy without target image or SHA"
-              exit 1
-            fi
-
-            echo "🎯 Target image: ${TARGET_IMAGE}"
-
-            # Verify image exists
-            if ! docker image inspect ${TARGET_IMAGE} >/dev/null 2>&1; then
-              echo "❌ ERROR: Image does not exist: ${TARGET_IMAGE}"
-              echo ""
-              echo "Demo limitation: Image must be built locally first."
-              if [ -n "$FINAL_SHA" ]; then
-                echo "To build this image, deploy SHA ${FINAL_SHA} to staging first:"
-                echo "  Comment: [staging] on the PR for this SHA"
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
+                echo "✅ Health check passed"
+                break
               fi
-              exit 1
-            fi
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⏳ Health check attempt $RETRY_COUNT/$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
+              else
+                echo "❌ Health check failed after $MAX_RETRIES attempts"
+                exit 1
+              fi
+            done
 
-            # Stop and remove existing container
-            if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "🛑 Stopping existing container: ${CONTAINER_NAME}"
-              docker stop ${CONTAINER_NAME} 2>/dev/null || true
-              echo "🗑️  Removing existing container: ${CONTAINER_NAME}"
-              docker rm ${CONTAINER_NAME} 2>/dev/null || true
-            fi
-
-            # Get image digest before deployment
-            IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${TARGET_IMAGE} 2>/dev/null || echo "")
-            if [ -z "$IMAGE_DIGEST" ]; then
-              IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${TARGET_IMAGE})
-            fi
-            echo "🔐 Image Digest: ${IMAGE_DIGEST}"
-
-            # Run new container with runtime env injection
-            echo "▶️  Running new container: ${CONTAINER_NAME}"
-            docker run -d \
-              --name ${CONTAINER_NAME} \
-              -p ${PORT}:8000 \
-              -e ENVIRONMENT=${ENVIRONMENT} \
-              -e DEPLOYMENT_ID="${{ github.run_id }}" \
-              -e CONTAINER_NAME=${CONTAINER_NAME} \
-              -e PORT=${PORT} \
-              -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
-              -e API_KEY="${API_KEY}" \
-              -e DB_HOST="${DB_HOST}" \
-              ${TARGET_IMAGE}
-
-            ACTUAL_IMAGE="${TARGET_IMAGE}"
-
-            # Wait for startup
-            echo "⏳ Waiting for service to start..."
-            sleep 5
+            echo "✅ Restart complete!"
+          SCRIPT_EOF
 
           # ============================================================
-          # ROLLBACK OPERATION
+          # REDEPLOY & ROLLBACK OPERATIONS
+          # Both operations deploy a specific SHA with identical logic
           # ============================================================
-          elif [ "$ACTION" = "rollback" ]; then
-            echo "⏪ Performing rollback operation..."
+          elif [ "$ACTION" = "redeploy" ] || [ "$ACTION" = "rollback" ]; then
 
+            # Display operation-specific message
+            if [ "$ACTION" = "redeploy" ]; then
+              echo "🔄 Performing redeploy operation..."
+            else
+              echo "⏪ Performing rollback operation..."
+            fi
+
+            # Validate SHA is provided
             if [ -z "$FINAL_SHA" ]; then
-              echo "❌ ERROR: Cannot rollback without target SHA"
+              echo "❌ ERROR: Cannot ${ACTION} without target SHA"
               exit 1
             fi
 
-            TARGET_IMAGE="${IMAGE_NAME}:${FINAL_SHA}"
-            echo "🎯 Rollback target: ${TARGET_IMAGE}"
+            echo "🎯 Target SHA: ${FINAL_SHA}"
 
-            # Verify image exists locally
-            if ! docker image inspect ${TARGET_IMAGE} >/dev/null 2>&1; then
-              echo "❌ ERROR: Rollback image does not exist locally: ${TARGET_IMAGE}"
-              echo ""
-              echo "Demo limitation: Image must be built locally first."
-              echo "To build this image, deploy SHA ${FINAL_SHA} to staging first:"
-              echo "  Comment: [staging] on the PR for this SHA"
-              echo ""
-              echo "Note: For production rollback, staging image gating is not required,"
-              echo "but the image must exist locally on the runner."
+            # Validate SHA format before SSH
+            if ! [[ "${FINAL_SHA}" =~ ^[a-f0-9]{40}$ ]]; then
+              echo "❌ ERROR: Invalid SHA format: ${FINAL_SHA}"
               exit 1
             fi
-            echo "✅ Rollback image verified: ${TARGET_IMAGE}"
 
-            # Stop and remove existing container
-            if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "🛑 Stopping existing container: ${CONTAINER_NAME}"
-              docker stop ${CONTAINER_NAME} 2>/dev/null || true
-              echo "🗑️  Removing existing container: ${CONTAINER_NAME}"
-              docker rm ${CONTAINER_NAME} 2>/dev/null || true
-            fi
+            # SSH into VM and deploy
+            # Pass environment variables explicitly to avoid variable expansion issues
+            echo "🔐 Connecting to VM via SSH..."
+            cat <<'SCRIPT_EOF' | ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+              VM_APP_PATH="${VM_APP_PATH}" \
+              FINAL_SHA="${FINAL_SHA}" \
+              VM_SERVICE_NAME="${VM_SERVICE_NAME}" \
+              ENVIRONMENT="${ENVIRONMENT}" \
+              DEPLOYMENT_ID="${{ github.run_id }}" \
+              API_KEY="${API_KEY}" \
+              DB_HOST="${DB_HOST}" \
+              bash -s
+            set -euo pipefail
 
-            # Get image digest before deployment
-            IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${TARGET_IMAGE} 2>/dev/null || echo "")
-            if [ -z "$IMAGE_DIGEST" ]; then
-              IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${TARGET_IMAGE})
-            fi
-            echo "🔐 Image Digest: ${IMAGE_DIGEST}"
+            cd "$VM_APP_PATH"
 
-            # Run rollback container with runtime env injection
-            echo "▶️  Running rollback container: ${CONTAINER_NAME}"
-            docker run -d \
-              --name ${CONTAINER_NAME} \
-              -p ${PORT}:8000 \
-              -e ENVIRONMENT=${ENVIRONMENT} \
-              -e DEPLOYMENT_ID="${{ github.run_id }}" \
-              -e CONTAINER_NAME=${CONTAINER_NAME} \
-              -e PORT=${PORT} \
-              -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
-              -e API_KEY="${API_KEY}" \
-              -e DB_HOST="${DB_HOST}" \
-              ${TARGET_IMAGE}
+            echo "🔧 Configuring git safe directory..."
+            git config --global --add safe.directory "$VM_APP_PATH"
 
-            ACTUAL_IMAGE="${TARGET_IMAGE}"
+            echo "📥 Fetching latest code from origin..."
+            git fetch --prune --tags origin
 
-            # Wait for startup
-            echo "⏳ Waiting for service to start..."
-            sleep 5
-          fi
+            echo "🧹 Cleaning working directory..."
+            git reset --hard
+            git clean -fd
 
-          # ============================================================
-          # HEALTH CHECK (common for all operations)
-          # ============================================================
-          echo "🏥 Checking service health..."
+            echo "📍 Checking out commit SHA: $FINAL_SHA"
+            git checkout "$FINAL_SHA"
 
-          # Verify container is running
-          if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "❌ Container failed to start or restart"
-            docker logs ${CONTAINER_NAME} 2>/dev/null || true
-            HEALTH_STATUS="failed"
-            echo "health_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+            echo "✅ Verifying checkout succeeded..."
+            DEPLOYED_SHA=$(git rev-parse HEAD)
+            echo "Deployed SHA: $DEPLOYED_SHA"
 
-          # Verify HTTP endpoint is responding (same retry logic as deploy.yml)
-          MAX_RETRIES=${HEALTH_CHECK_MAX_RETRIES}
-          RETRY_COUNT=0
+            echo "📝 Writing environment variables..."
+            cat > "$VM_APP_PATH/.env" <<ENV_EOF
+          ENVIRONMENT=$ENVIRONMENT
+          DEPLOYMENT_ID=$DEPLOYMENT_ID
+          API_KEY=$API_KEY
+          DB_HOST=$DB_HOST
+          PORT=8000
+          COMMIT_SHA=$DEPLOYED_SHA
+          ENV_EOF
 
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            if curl -f -s -o /dev/null http://localhost:${PORT}/ 2>/dev/null; then
-              HEALTH_STATUS="healthy"
-              echo "✅ Service is healthy and responding"
-              break
-            fi
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-            echo "⏳ Attempt $RETRY_COUNT/$MAX_RETRIES - waiting for service..."
-            sleep ${HEALTH_CHECK_RETRY_SLEEP}
-          done
+            echo "🔄 Restarting service..."
+            sudo systemctl restart "$VM_SERVICE_NAME"
 
-          if [ "$HEALTH_STATUS" != "healthy" ]; then
-            echo "⚠️  Warning: Service health check did not pass within timeout"
-            echo "   Container is running but may not be fully ready"
-            HEALTH_STATUS="running_unverified"
-          fi
+            echo "⏳ Waiting for service to initialize..."
+            sleep 3
 
-          # ============================================================
-          # RECORD TO LOCAL HISTORY (only on successful operations)
-          # ============================================================
-          # Note: We only reach this point if:
-          #   1. Container is running (verified above)
-          #   2. Health check passed or timed out with "running_unverified"
-          # If container failed to start, we would have exited above with exit 1
-          HISTORY_FILE="/tmp/myapp-${ENVIRONMENT}.history"
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            echo "🏥 Checking health endpoint..."
+            MAX_RETRIES=10
+            RETRY_DELAY=2
+            RETRY_COUNT=0
 
-          # Record all ops actions to history (restart, redeploy, rollback)
-          if [ -n "$FINAL_SHA" ]; then
-            echo "📝 Recording to local history: ${HISTORY_FILE}"
-            echo "${TIMESTAMP} action=${ACTION} sha=${FINAL_SHA} image=${ACTUAL_IMAGE:-${IMAGE_NAME}:${FINAL_SHA}} digest=${IMAGE_DIGEST} run_id=${{ github.run_id }}" >> ${HISTORY_FILE}
-          elif [ "$ACTION" = "restart" ] && [ -n "$ACTUAL_IMAGE" ]; then
-            # Record restart with image info (helpful for tracking)
-            echo "📝 Recording restart to local history: ${HISTORY_FILE}"
-            echo "${TIMESTAMP} action=${ACTION} image=${ACTUAL_IMAGE} digest=${IMAGE_DIGEST} run_id=${{ github.run_id }}" >> ${HISTORY_FILE}
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
+                echo "✅ Health check passed"
+                break
+              fi
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⏳ Health check attempt $RETRY_COUNT/$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
+              else
+                echo "❌ Health check failed after $MAX_RETRIES attempts"
+                exit 1
+              fi
+            done
+
+            echo "✅ Deployment complete!"
+          SCRIPT_EOF
+
+            echo "✅ ${ACTION} completed successfully"
+            echo "📍 SHA: ${FINAL_SHA}"
+            echo "🖥️  VM: ${VM_HOST}"
           fi
 
           # Set outputs
-          echo "health_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
-          echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
+          echo "health_status=deployed" >> $GITHUB_OUTPUT
 
           echo "✅ Ops operation completed successfully"
-          echo "🏥 Health: ${HEALTH_STATUS}"
-          echo "🔐 Digest: ${IMAGE_DIGEST}"
+          echo "📍 SHA: ${FINAL_SHA:-current}"
+          echo "🖥️  VM: ${VM_HOST}"
 
       # STEP 8: Post ops status comment
       # Posts result to Ops Console issue
@@ -1431,8 +1284,6 @@ jobs:
           script: |
             const action = '${{ steps.validate.outputs.action }}';
             const environment = '${{ steps.validate.outputs.environment }}';
-            const containerName = '${{ steps.validate.outputs.container_name }}';
-            const port = '${{ steps.validate.outputs.port }}';
             const requester = '${{ steps.validate.outputs.requester }}';
             const finalSha = '${{ steps.determine_sha.outputs.final_sha }}';
             const targetSha = '${{ steps.validate.outputs.target_sha }}';
@@ -1441,7 +1292,8 @@ jobs:
             const usedApi = '${{ steps.compute_rollback_api.outputs.used_api }}';
             const jobStatus = '${{ job.status }}';
             const healthStatus = '${{ steps.execute_ops.outputs.health_status }}';
-            const imageDigest = '${{ steps.execute_ops.outputs.image_digest }}';
+            const vmHost = process.env.VM_HOST;
+            const vmAppPath = process.env.VM_APP_PATH;
 
             const statusEmoji = jobStatus === 'success' ? '✅' : '❌';
             const statusText = jobStatus === 'success' ? 'SUCCEEDED' : 'FAILED';
@@ -1456,17 +1308,16 @@ jobs:
               if (targetSha) {
                 targetDesc = `SHA: \`${targetSha}\``;
               } else {
-                const source = usedApi === 'true' ? 'GitHub Deployments API' : 'Local history fallback';
+                const source = usedApi === 'true' ? 'GitHub Deployments API' : 'Deployment history';
                 targetDesc = `${steps_back} step(s) back from \`${currentSha?.substring(0, 7) || 'current'}\` (via ${source})`;
               }
             }
 
             // Map health status to display text
             const healthMap = {
-              'healthy': '✅ Healthy (verified)',
-              'running_unverified': '⚠️ Running (unverified)',
+              'deployed': '✅ Deployed',
               'failed': '❌ Failed',
-              '': jobStatus === 'success' ? '✅ Running' : '❌ Failed'
+              '': jobStatus === 'success' ? '✅ Deployed' : '❌ Failed'
             };
             const healthDisplay = healthMap[healthStatus] || healthStatus;
 
@@ -1481,15 +1332,14 @@ jobs:
             | **Requested By** | @${requester} |
             | **Target** | ${targetDesc} |
             | **Result SHA** | \`${finalSha || 'N/A'}\` |
-            | **Container** | \`${containerName}\` |
-            | **Port** | \`${port}\` |
-            ${imageDigest ? `| **Image Digest** | \`${imageDigest.substring(0, 80)}${imageDigest.length > 80 ? '...' : ''}\` |` : ''}
+            | **VM Host** | \`${vmHost}\` |
+            | **App Path** | \`${vmAppPath}\` |
             | **Service Status** | ${healthDisplay} |
             `;
 
             if (jobStatus === 'success') {
               comment += `\n---\n#### 🌐 Access Information\n`;
-              comment += `**URL:** http://localhost:${port}/\n`;
+              comment += `**VM:** ${vmHost}\n`;
               comment += `**Workflow Run:** [View Logs](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n`;
             } else {
               comment += `\n---\n#### ⚠️ Action Required\n`;
@@ -1553,8 +1403,8 @@ jobs:
             // Sanitize description
             description = sanitize(description);
 
-            const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
-            const environmentUrl = `http://localhost:${port}/`;
+            const vmHost = process.env.VM_HOST;
+            const environmentUrl = `http://${vmHost}/${environment}`;
             const logUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
             await github.rest.repos.createDeploymentStatus({
@@ -1570,3 +1420,81 @@ jobs:
             });
 
             core.info(`Deployment status updated: ${state}`);
+
+      # STEP 10: Update Deployment History Wiki
+      # Updates the GitHub Wiki with deployment history after successful deployment
+      # Only runs if the deployment was successful
+      - name: Update Deployment History Wiki
+        if: success() && steps.create_deployment.outputs.deployment_id
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Import and run the wiki generator script
+            const scriptPath = path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/update-deployment-wiki.js');
+            const generateWikiContent = require(scriptPath);
+            const markdownContent = await generateWikiContent({ github, context, core });
+
+            // Clone wiki repository
+            const wikiUrl = `https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git`;
+            const wikiDir = path.join(process.env.RUNNER_TEMP, 'wiki');
+
+            core.info('📚 Cloning wiki repository...');
+
+            try {
+              // Clone wiki (or initialize if it doesn't exist)
+              await exec.exec('git', ['clone', wikiUrl, wikiDir], {
+                ignoreReturnCode: true
+              });
+
+              // If wiki doesn't exist, initialize it
+              if (!fs.existsSync(path.join(wikiDir, '.git'))) {
+                core.info('Wiki does not exist yet, initializing...');
+                fs.mkdirSync(wikiDir, { recursive: true });
+                await exec.exec('git', ['init'], { cwd: wikiDir });
+                await exec.exec('git', ['remote', 'add', 'origin', wikiUrl], { cwd: wikiDir });
+              }
+
+              // Configure git
+              await exec.exec('git', ['config', 'user.name', 'github-actions[bot]'], { cwd: wikiDir });
+              await exec.exec('git', ['config', 'user.email', 'github-actions[bot]@users.noreply.github.com'], { cwd: wikiDir });
+
+              // Write the markdown file
+              const wikiFilePath = path.join(wikiDir, 'Deployment-History.md');
+              fs.writeFileSync(wikiFilePath, markdownContent, 'utf8');
+              core.info('✅ Deployment-History.md written successfully');
+
+              // Commit and push
+              await exec.exec('git', ['add', 'Deployment-History.md'], { cwd: wikiDir });
+
+              // Check if there are changes to commit
+              let hasChanges = false;
+              await exec.exec('git', ['diff', '--staged', '--quiet'], {
+                cwd: wikiDir,
+                ignoreReturnCode: true,
+                listeners: {
+                  errline: () => { hasChanges = true; }
+                }
+              });
+
+              // If git diff exits with non-zero, there are changes
+              const { exitCode } = await exec.getExecOutput('git', ['diff', '--staged', '--quiet'], {
+                cwd: wikiDir,
+                ignoreReturnCode: true
+              });
+
+              if (exitCode !== 0) {
+                core.info('📝 Changes detected, committing...');
+                await exec.exec('git', ['commit', '-m', 'Update deployment history'], { cwd: wikiDir });
+                await exec.exec('git', ['push', 'origin', 'HEAD'], { cwd: wikiDir });
+                core.info('✅ Wiki updated successfully');
+              } else {
+                core.info('ℹ️  No changes to wiki content');
+              }
+
+            } catch (error) {
+              core.warning(`Failed to update wiki: ${error.message}`);
+              core.info('This is non-critical - deployment was still successful');
+            }
