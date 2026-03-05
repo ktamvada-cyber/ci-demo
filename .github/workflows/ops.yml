@@ -1420,3 +1420,82 @@ jobs:
             });
 
             core.info(`Deployment status updated: ${state}`);
+
+      # STEP 10: Update Deployment History Wiki
+      # Updates the GitHub Wiki with deployment history after successful deployment
+      # Only runs if the deployment was successful
+      - name: Update Deployment History Wiki
+        if: success() && steps.create_deployment.outputs.deployment_id
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const exec = require('@actions/exec');
+
+            // Import and run the wiki generator script
+            const scriptPath = path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/update-deployment-wiki.js');
+            const generateWikiContent = require(scriptPath);
+            const markdownContent = await generateWikiContent({ github, context, core });
+
+            // Clone wiki repository
+            const wikiUrl = `https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git`;
+            const wikiDir = path.join(process.env.RUNNER_TEMP, 'wiki');
+
+            core.info('📚 Cloning wiki repository...');
+
+            try {
+              // Clone wiki (or initialize if it doesn't exist)
+              await exec.exec('git', ['clone', wikiUrl, wikiDir], {
+                ignoreReturnCode: true
+              });
+
+              // If wiki doesn't exist, initialize it
+              if (!fs.existsSync(path.join(wikiDir, '.git'))) {
+                core.info('Wiki does not exist yet, initializing...');
+                fs.mkdirSync(wikiDir, { recursive: true });
+                await exec.exec('git', ['init'], { cwd: wikiDir });
+                await exec.exec('git', ['remote', 'add', 'origin', wikiUrl], { cwd: wikiDir });
+              }
+
+              // Configure git
+              await exec.exec('git', ['config', 'user.name', 'github-actions[bot]'], { cwd: wikiDir });
+              await exec.exec('git', ['config', 'user.email', 'github-actions[bot]@users.noreply.github.com'], { cwd: wikiDir });
+
+              // Write the markdown file
+              const wikiFilePath = path.join(wikiDir, 'Deployment-History.md');
+              fs.writeFileSync(wikiFilePath, markdownContent, 'utf8');
+              core.info('✅ Deployment-History.md written successfully');
+
+              // Commit and push
+              await exec.exec('git', ['add', 'Deployment-History.md'], { cwd: wikiDir });
+
+              // Check if there are changes to commit
+              let hasChanges = false;
+              await exec.exec('git', ['diff', '--staged', '--quiet'], {
+                cwd: wikiDir,
+                ignoreReturnCode: true,
+                listeners: {
+                  errline: () => { hasChanges = true; }
+                }
+              });
+
+              // If git diff exits with non-zero, there are changes
+              const { exitCode } = await exec.getExecOutput('git', ['diff', '--staged', '--quiet'], {
+                cwd: wikiDir,
+                ignoreReturnCode: true
+              });
+
+              if (exitCode !== 0) {
+                core.info('📝 Changes detected, committing...');
+                await exec.exec('git', ['commit', '-m', 'Update deployment history'], { cwd: wikiDir });
+                await exec.exec('git', ['push', 'origin', 'HEAD'], { cwd: wikiDir });
+                core.info('✅ Wiki updated successfully');
+              } else {
+                core.info('ℹ️  No changes to wiki content');
+              }
+
+            } catch (error) {
+              core.warning(`Failed to update wiki: ${error.message}`);
+              core.info('This is non-critical - deployment was still successful');
+            }
