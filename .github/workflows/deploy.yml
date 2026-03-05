@@ -1003,7 +1003,6 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
-            const exec = require('@actions/exec');
 
             // Import and run the wiki generator script
             const scriptPath = path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/update-deployment-wiki.js');
