@@ -1438,7 +1438,7 @@ jobs:
             const markdownContent = await generateWikiContent({ github, context, core });
 
             // Clone wiki repository
-            const wikiUrl = `https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git`;
+            const wikiUrl = `https://x-access-token:${{ secrets.WIKI_TOKEN }}@github.com/${{ github.repository }}.wiki.git`;
             const wikiDir = path.join(process.env.RUNNER_TEMP, 'wiki');
 
             core.info('📚 Cloning wiki repository...');
