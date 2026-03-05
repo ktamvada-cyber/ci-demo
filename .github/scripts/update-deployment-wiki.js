@@ -45,6 +45,11 @@ module.exports = async ({ github, context, core }) => {
           break;
         }
 
+        // Skip deployments without description (not created by our workflows)
+        if (!deployment.description) {
+          continue;
+        }
+
         try {
           const statusesResponse = await github.rest.repos.listDeploymentStatuses({
             owner,
