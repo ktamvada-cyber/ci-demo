@@ -7,8 +7,8 @@ app = FastAPI()
 @app.get("/")
 def read_root():
     return {
-        "message": "Hello from Feature 1 - v2.5",
-        "version": "2.5",
+        "message": "Hello from Feature 1 - v2.6",
+        "version": "2.6",
         "commit": os.getenv("COMMIT_SHA", "unknown"),
         "environment": os.getenv("ENVIRONMENT", "unknown")
     }
@@ -56,7 +56,7 @@ def version_info():
     Useful for verifying which version is deployed via GitHub Deployments.
     """
     return {
-        "version": "2.5",
+        "version": "2.6",
         "commit_sha": os.getenv("COMMIT_SHA", "unknown"),
         "environment": os.getenv("ENVIRONMENT", "unknown"),
         "deployment_id": os.getenv("DEPLOYMENT_ID", "unknown"),
