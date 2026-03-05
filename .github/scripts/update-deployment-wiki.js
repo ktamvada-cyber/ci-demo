@@ -238,10 +238,18 @@ module.exports = async ({ github, context, core }) => {
     // Fetch commit details
     const commit = await fetchCommitDetails(sha);
 
-    // Fetch PR details
-    const pr = await fetchPRForCommit(sha);
-    const prLink = pr ? `[#${pr.number}](https://github.com/${owner}/${repo}/pull/${pr.number})` : 'N/A';
-    const prTitle = pr ? pr.title : '';
+    // Get PR number from deployment payload (triggering PR) instead of commit association
+    // This shows which PR triggered the deployment, not where the code originated
+    const payload = deployment.payload || {};
+    let prNumber = payload.pr_number;
+
+    // Fallback to commit association for older deployments without payload
+    if (!prNumber) {
+      const prFromCommit = await fetchPRForCommit(sha);
+      prNumber = prFromCommit ? prFromCommit.number : null;
+    }
+
+    const prLink = prNumber ? `[#${prNumber}](https://github.com/${owner}/${repo}/pull/${prNumber})` : 'N/A';
 
     // Extract operation and trigger
     const operation = extractOperationType(deployment);
