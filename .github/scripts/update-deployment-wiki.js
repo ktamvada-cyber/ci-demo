@@ -142,9 +142,21 @@ module.exports = async ({ github, context, core }) => {
 
       const prs = prsResponse.data;
       if (prs && prs.length > 0) {
+        // When multiple PRs share the same SHA, prefer:
+        // 1. Open PRs over closed/merged
+        // 2. Most recently updated PR
+        const sortedPrs = prs.sort((a, b) => {
+          // Prefer open PRs
+          if (a.state === 'open' && b.state !== 'open') return -1;
+          if (a.state !== 'open' && b.state === 'open') return 1;
+          // Then prefer most recently updated
+          return new Date(b.updated_at) - new Date(a.updated_at);
+        });
+
+        const selectedPr = sortedPrs[0];
         const prData = {
-          number: prs[0].number,
-          title: prs[0].title
+          number: selectedPr.number,
+          title: selectedPr.title
         };
         // Cache the result
         prCache.set(sha, prData);

@@ -971,9 +971,21 @@ jobs:
               });
 
               if (prs.length > 0) {
-                prNumber = prs[0].number;
-                branchName = prs[0].head.ref;
-                core.info(`   SHA ${shortSha} from PR #${prNumber} (${branchName})`);
+                // When multiple PRs share the same SHA, prefer:
+                // 1. Open PRs over closed/merged
+                // 2. Most recently updated PR
+                const sortedPrs = prs.sort((a, b) => {
+                  // Prefer open PRs
+                  if (a.state === 'open' && b.state !== 'open') return -1;
+                  if (a.state !== 'open' && b.state === 'open') return 1;
+                  // Then prefer most recently updated
+                  return new Date(b.updated_at) - new Date(a.updated_at);
+                });
+
+                const selectedPr = sortedPrs[0];
+                prNumber = selectedPr.number;
+                branchName = selectedPr.head.ref;
+                core.info(`   SHA ${shortSha} from PR #${prNumber} (${branchName})${prs.length > 1 ? ` [selected from ${prs.length} PRs]` : ''}`);
               } else {
                 // Strategy 2: Check if SHA is HEAD of any branch
                 const { data: branches } = await github.rest.repos.listBranchesForHeadCommit({
