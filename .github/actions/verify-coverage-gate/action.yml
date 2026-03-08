@@ -1,0 +1,131 @@
+name: 'Verify Coverage Gate'
+description: 'Verifies test coverage requirements are met for deployment'
+author: 'CI/CD Team'
+
+inputs:
+  target-sha:
+    description: 'Target commit SHA to verify coverage for'
+    required: true
+  action-type:
+    description: 'Type of action (deployment, redeploy, rollback)'
+    required: false
+    default: 'deployment'
+  original-ref:
+    description: 'Original ref if SHA was resolved from tag/branch'
+    required: false
+    default: ''
+  github-token:
+    description: 'GitHub token for API access'
+    required: true
+
+outputs:
+  coverage_pct:
+    description: 'Coverage percentage extracted from check'
+    value: ${{ steps.verify.outputs.coverage_pct }}
+  coverage_check_url:
+    description: 'URL to the coverage check run'
+    value: ${{ steps.verify.outputs.coverage_check_url }}
+  target_sha:
+    description: 'Target SHA that was checked'
+    value: ${{ steps.verify.outputs.target_sha }}
+  error_message:
+    description: 'Error message if verification failed'
+    value: ${{ steps.verify.outputs.error_message }}
+  check_url:
+    description: 'URL to the check run (same as coverage_check_url)'
+    value: ${{ steps.verify.outputs.check_url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify coverage gate
+      id: verify
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const targetSha = '${{ inputs.target-sha }}';
+          const action = '${{ inputs.action-type }}';
+          const originalRef = '${{ inputs.original-ref }}';
+          const isResolved = originalRef && originalRef !== targetSha;
+          const requiredCheckName = 'test-coverage';  // Must match job name in test-coverage.yml
+
+          if (isResolved) {
+            core.info(`🔍 Checking coverage gate for ${action} to ${originalRef} → ${targetSha}`);
+          } else {
+            core.info(`🔍 Checking coverage gate for ${action} to SHA: ${targetSha}`);
+          }
+
+          // Query ALL check runs on this SHA (do not use check_name filter to avoid API quirks)
+          const { data: allChecks } = await github.rest.checks.listForRef({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: targetSha
+          });
+
+          core.info(`Found ${allChecks.total_count} total check runs for SHA ${targetSha.substring(0, 7)}`);
+
+          // Filter to find the coverage check by exact name match
+          const coverageChecks = allChecks.check_runs.filter(check => check.name === requiredCheckName);
+
+          core.info(`Found ${coverageChecks.length} check runs with name="${requiredCheckName}"`);
+
+          // Verify coverage check exists
+          if (coverageChecks.length === 0) {
+            const errorMsg = `❌ COVERAGE GATE FAILED: No "${requiredCheckName}" check found for SHA ${targetSha.substring(0, 7)}.\n\nCoverage tests must run before ${action}.`;
+            core.setOutput('error_message', errorMsg);
+            core.setOutput('target_sha', targetSha);
+            core.setFailed(errorMsg);
+            return { passed: false };
+          }
+
+          // Sort by completed_at (or started_at if not completed) descending to get most recent
+          const sortedChecks = coverageChecks.sort((a, b) => {
+            const timeA = new Date(a.completed_at || a.started_at || 0);
+            const timeB = new Date(b.completed_at || b.started_at || 0);
+            return timeB - timeA; // Newest first
+          });
+
+          // Get the most recent check run
+          const coverageCheck = sortedChecks[0];
+          core.info(`Using check run ID ${coverageCheck.id} (${coverageCheck.completed_at || coverageCheck.started_at})`);
+          core.info(`Check status: ${coverageCheck.status}, conclusion: ${coverageCheck.conclusion}`);
+
+          // Verify check is completed
+          if (coverageCheck.status !== 'completed') {
+            const statusMsg = coverageCheck.status === 'in_progress' ? 'still running' : coverageCheck.status;
+            const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check is ${statusMsg}. Wait for coverage tests to complete.\n\nCheck: ${coverageCheck.html_url}`;
+            core.setOutput('error_message', errorMsg);
+            core.setOutput('target_sha', targetSha);
+            core.setOutput('check_url', coverageCheck.html_url);
+            core.setFailed(errorMsg);
+            return { passed: false };
+          }
+
+          // Verify check passed
+          if (coverageCheck.conclusion !== 'success') {
+            const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check ${coverageCheck.conclusion}. Coverage must be ≥70% for ${action}.\n\nCheck: ${coverageCheck.html_url}`;
+            core.setOutput('error_message', errorMsg);
+            core.setOutput('target_sha', targetSha);
+            core.setOutput('check_url', coverageCheck.html_url);
+            core.setFailed(errorMsg);
+            return { passed: false };
+          }
+
+          // Extract coverage percentage from check run output (if available)
+          let coveragePct = 'N/A';
+          if (coverageCheck.output && coverageCheck.output.title) {
+            // Parse coverage from title like "✅ Coverage 74.0% (≥70%)"
+            const match = coverageCheck.output.title.match(/Coverage\s+([\d.]+)%/);
+            if (match) {
+              coveragePct = match[1];
+              core.info(`Extracted coverage: ${coveragePct}%`);
+            }
+          }
+
+          core.info(`✅ Coverage gate passed`);
+          core.setOutput('coverage_check_url', coverageCheck.html_url);
+          core.setOutput('coverage_pct', coveragePct);
+          core.setOutput('target_sha', targetSha);
+
+          return { passed: true, coveragePct };

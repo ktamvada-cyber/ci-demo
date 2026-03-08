@@ -1,0 +1,40 @@
+name: 'Setup SSH for VM Access'
+description: 'Configures SSH authentication for VM deployments'
+author: 'CI/CD Team'
+
+# Inputs: None required - uses repository configuration
+# Secrets are accessed from the calling workflow's context
+
+inputs:
+  ssh-private-key:
+    description: 'SSH private key for VM access'
+    required: true
+  vm-host:
+    description: 'VM hostname or IP address'
+    required: true
+  vm-user:
+    description: 'VM SSH username'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure SSH authentication
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "🔐 Configuring SSH authentication..."
+
+        # Create .ssh directory with correct permissions
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+
+        # Install SSH private key from secrets
+        echo "${{ inputs.ssh-private-key }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+
+        # Add VM host to known_hosts to avoid host verification prompt
+        ssh-keyscan -H ${{ inputs.vm-host }} >> ~/.ssh/known_hosts 2>/dev/null
+
+        echo "✅ SSH key configured for ${{ inputs.vm-user }}@${{ inputs.vm-host }}"
