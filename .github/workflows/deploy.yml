@@ -28,6 +28,8 @@ env:
   VM_USER: ${{ vars.VM_USER }}
   VM_APP_PATH: ${{ vars.VM_APP_PATH }}
   VM_SERVICE_NAME: ${{ vars.VM_SERVICE_NAME }}
+  AUTHORIZED_STAGING_USERS: ${{ vars.AUTHORIZED_STAGING_USERS }}
+  AUTHORIZED_PRODUCTION_USERS: ${{ vars.AUTHORIZED_PRODUCTION_USERS }}
 
 # Concurrency control: Only ONE deployment at a time across all environments
 # Cancel any in-progress deployment when a new one is triggered
@@ -47,13 +49,21 @@ jobs:
     # Staging deployments proceed automatically after validation
     environment:
       name: ${{ github.event.comment.body == '[prod]' && 'production' || 'staging' }}
-      url: ${{ github.event.comment.body == '[prod]' && 'http://192.168.64.2/production' || 'http://192.168.64.2/staging' }}
+      url: ${{ format('http://{0}/{1}', vars.VM_HOST, github.event.comment.body == '[prod]' && 'production' || 'staging') }}
 
     # Prevent runaway deployments - fail if job exceeds 15 minutes
     # Note: For production, this timeout includes time waiting for manual approval
     timeout-minutes: 15
 
     steps:
+      # STEP 0: Checkout repository for composite actions
+      # GitHub Actions best practice: Check out repository at the start of the job
+      # This ensures all composite actions under .github/actions/ are available throughout the workflow
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       # STEP 1: Validate deployment trigger and perform all security checks
       - name: Validate deployment trigger and permissions
         id: validate
@@ -80,16 +90,15 @@ jobs:
             // Different users can deploy to different environments
             const commenter = context.payload.comment.user.login;
 
-            // Define authorized users per environment
-            const stagingAuthorizedUsers = [
-              'ktamvada-cyber',  // repository owner
-              'gromag'           // additional staging deployer
-            ];
+            // Define authorized users per environment from repository variables
+            // This allows managing deployment permissions without modifying workflow code
+            const stagingAuthorizedUsers = process.env.AUTHORIZED_STAGING_USERS
+              .split(',')
+              .map(u => u.trim());
 
-            const productionAuthorizedUsers = [
-             'ktamvada-cyber',  // repository owner
-              'gromag'           // ONLY gromag can deploy to production (strict)
-            ];
+            const productionAuthorizedUsers = process.env.AUTHORIZED_PRODUCTION_USERS
+              .split(',')
+              .map(u => u.trim());
 
             // Check authorization based on target environment
             const authorizedUsers = environment === 'staging'
@@ -289,16 +298,6 @@ jobs:
               description: `Deployment started for ${environment}`,
               log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             });
-
-      # STEP 1.5.1: Checkout repository for composite actions
-      # Composite actions require the repository code to be present in the runner workspace
-      # This is a minimal checkout (fetch-depth: 1) just to access .github/actions/*
-      # The actual deployment checkout happens later at the exact PR SHA
-      - name: Checkout repository for composite actions
-        if: steps.validate.outputs.should_deploy == 'true'
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       # STEP 1.6: Verify Coverage Gate Passed
       # COVERAGE GATE: Block deployment if coverage check missing or failed

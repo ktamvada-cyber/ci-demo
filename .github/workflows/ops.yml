@@ -50,8 +50,8 @@ on:
 env:
   # SECURITY: Only allow ops commands from this specific issue number (Ops Console)
   # Commands from any other issue will be rejected
-  # TODO: Create a pinned "Ops Console" issue and set the number here
-  OPS_ISSUE_NUMBER: 2
+  # See .github/PHASE1-SETUP.md for setup instructions
+  OPS_ISSUE_NUMBER: ${{ vars.OPS_ISSUE_NUMBER }}
 
   # VM configuration sourced from repository variables for centralized management
   # See .github/PHASE1-SETUP.md for setup instructions
@@ -80,8 +80,8 @@ jobs:
   ops:
     # Security: Only run on non-PR issues (ops console) or manual workflow_dispatch
     # This prevents ops workflow from triggering on PR comments (those should use deploy.yml)
-    # For issue comments, ONLY run on the designated Ops Console issue (#2)
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && github.event.issue.number == 2)
+    # For issue comments, ONLY run on the designated Ops Console issue
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && github.event.issue.number == vars.OPS_ISSUE_NUMBER)
     runs-on: self-hosted
 
     # GitHub Environment protection (requires manual approval for production if configured)
@@ -89,12 +89,20 @@ jobs:
     # Strict matching: [prod-restart], [prod-redeploy...], [prod-rollback...]
     environment:
       name: ${{ github.event.inputs.environment || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')) && 'production' || 'staging') }}
-      url: ${{ (github.event.inputs.environment == 'production' || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')))) && 'http://192.168.64.2/production' || 'http://192.168.64.2/staging' }}
+      url: ${{ format('http://{0}/{1}', vars.VM_HOST, (github.event.inputs.environment == 'production' || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')))) && 'production' || 'staging') }}
 
     # Prevent runaway operations - fail if job exceeds 15 minutes
     timeout-minutes: 15
 
     steps:
+      # STEP 0: Checkout repository for composite actions
+      # GitHub Actions best practice: Check out repository at the start of the job
+      # This ensures all composite actions under .github/actions/ are available throughout the workflow
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       # STEP 1: Validate and parse ops trigger
       # Detects trigger source (workflow_dispatch vs issue_comment)
       # Parses and validates inputs strictly
@@ -778,16 +786,6 @@ jobs:
           echo "final_sha=${FINAL_SHA}" >> $GITHUB_OUTPUT
 
           echo "✅ Target determined: SHA=${FINAL_SHA:-'current'}"
-
-      # STEP 5.4.1: Checkout repository for composite actions
-      # Composite actions require the repository code to be present in the runner workspace
-      # This is a minimal checkout (fetch-depth: 1) just to access .github/actions/*
-      # The actual deployment checkout happens later at the exact target SHA
-      - name: Checkout repository for composite actions
-        if: steps.validate.outputs.should_run == 'true'
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       # STEP 5.5: Verify Coverage Gate Passed
       # COVERAGE GATE: Block redeploy/rollback if coverage check missing or failed
