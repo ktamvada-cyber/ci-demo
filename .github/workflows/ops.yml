@@ -1012,195 +1012,119 @@ jobs:
           vm-host: ${{ env.VM_HOST }}
           vm-user: ${{ env.VM_USER }}
 
-      # STEP 7: Execute ops operation
-      # Performs restart, redeploy, or rollback via SSH on VM
-      - name: Execute Ops Operation
-        id: execute_ops
-        if: steps.validate.outputs.should_run == 'true'
+      # STEP 7a: Execute Restart Operation
+      # Restarts the service with current code (no git checkout)
+      - name: Execute Restart Operation
+        id: execute_restart
+        if: steps.validate.outputs.should_run == 'true' && steps.validate.outputs.action == 'restart'
         env:
-          ACTION: ${{ steps.validate.outputs.action }}
           ENVIRONMENT: ${{ steps.validate.outputs.environment }}
-          FINAL_SHA: ${{ steps.determine_sha.outputs.final_sha }}
           API_KEY: ${{ secrets.API_KEY }}
           DB_HOST: ${{ secrets.DB_HOST }}
         run: |
           set -euo pipefail
 
-          echo "Runner: $(hostname)"
-          echo "GitHub Run ID: ${{ github.run_id }}"
-          echo "VM: ${VM_HOST}"
-          echo ""
-          echo "Executing ops operation: ${ACTION} on ${ENVIRONMENT}"
+          echo "♻️  Performing restart operation..."
           echo "VM Host: ${VM_HOST}"
           echo "App Path: ${VM_APP_PATH}"
 
-          # ============================================================
-          # RESTART OPERATION
-          # ============================================================
-          if [ "$ACTION" = "restart" ]; then
-            echo "♻️  Performing restart operation..."
+          # SSH into VM and restart service
+          # Pass environment variables explicitly to avoid variable expansion issues
+          cat <<'SCRIPT_EOF' | ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+            VM_SERVICE_NAME="${VM_SERVICE_NAME}" \
+            VM_APP_PATH="${VM_APP_PATH}" \
+            ENVIRONMENT="${ENVIRONMENT}" \
+            DEPLOYMENT_ID="${{ github.run_id }}" \
+            API_KEY="${API_KEY}" \
+            DB_HOST="${DB_HOST}" \
+            APP_PORT="${{ vars.APP_PORT }}" \
+            bash -s
+          set -euo pipefail
 
-            # SSH into VM and restart service
-            # Pass environment variables explicitly to avoid variable expansion issues
-            cat <<'SCRIPT_EOF' | ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
-              VM_SERVICE_NAME="${VM_SERVICE_NAME}" \
-              VM_APP_PATH="${VM_APP_PATH}" \
-              ENVIRONMENT="${ENVIRONMENT}" \
-              DEPLOYMENT_ID="${{ github.run_id }}" \
-              API_KEY="${API_KEY}" \
-              DB_HOST="${DB_HOST}" \
-              bash -s
-            set -euo pipefail
-
-            echo "📝 Writing environment variables..."
-            cat > "$VM_APP_PATH/.env" <<ENV_EOF
+          echo "📝 Writing environment variables..."
+          cat > "$VM_APP_PATH/.env" <<ENV_EOF
           ENVIRONMENT=$ENVIRONMENT
           DEPLOYMENT_ID=$DEPLOYMENT_ID
           API_KEY=$API_KEY
           DB_HOST=$DB_HOST
-          PORT=8000
+          PORT=$APP_PORT
           COMMIT_SHA=$(cd "$VM_APP_PATH" && git rev-parse HEAD 2>/dev/null || echo "unknown")
           ENV_EOF
 
-            echo "🔄 Restarting service..."
-            sudo systemctl restart "$VM_SERVICE_NAME"
+          echo "🔄 Restarting service..."
+          sudo systemctl restart "$VM_SERVICE_NAME"
 
-            echo "⏳ Waiting for service to initialize..."
-            sleep 3
+          echo "⏳ Waiting for service to initialize..."
+          sleep 3
 
-            echo "🏥 Checking health endpoint..."
-            MAX_RETRIES=10
-            RETRY_DELAY=2
-            RETRY_COUNT=0
+          echo "🏥 Checking health endpoint..."
+          MAX_RETRIES=10
+          RETRY_DELAY=2
+          RETRY_COUNT=0
 
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-              if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
-                echo "✅ Health check passed"
-                break
-              fi
-              RETRY_COUNT=$((RETRY_COUNT + 1))
-              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                echo "⏳ Health check attempt $RETRY_COUNT/$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-                sleep $RETRY_DELAY
-              else
-                echo "❌ Health check failed after $MAX_RETRIES attempts"
-                exit 1
-              fi
-            done
-
-            echo "✅ Restart complete!"
-          SCRIPT_EOF
-
-          # ============================================================
-          # REDEPLOY & ROLLBACK OPERATIONS
-          # Both operations deploy a specific SHA with identical logic
-          # ============================================================
-          elif [ "$ACTION" = "redeploy" ] || [ "$ACTION" = "rollback" ]; then
-
-            # Display operation-specific message
-            if [ "$ACTION" = "redeploy" ]; then
-              echo "🔄 Performing redeploy operation..."
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if curl -f -s http://localhost:$APP_PORT/ >/dev/null 2>&1; then
+              echo "✅ Health check passed"
+              break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "⏳ Health check attempt $RETRY_COUNT/$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
+              sleep $RETRY_DELAY
             else
-              echo "⏪ Performing rollback operation..."
-            fi
-
-            # Validate SHA is provided
-            if [ -z "$FINAL_SHA" ]; then
-              echo "❌ ERROR: Cannot ${ACTION} without target SHA"
+              echo "❌ Health check failed after $MAX_RETRIES attempts"
               exit 1
             fi
+          done
 
-            echo "🎯 Target SHA: ${FINAL_SHA}"
-
-            # Validate SHA format before SSH
-            if ! [[ "${FINAL_SHA}" =~ ^[a-f0-9]{40}$ ]]; then
-              echo "❌ ERROR: Invalid SHA format: ${FINAL_SHA}"
-              exit 1
-            fi
-
-            # SSH into VM and deploy
-            # Pass environment variables explicitly to avoid variable expansion issues
-            echo "🔐 Connecting to VM via SSH..."
-            cat <<'SCRIPT_EOF' | ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
-              VM_APP_PATH="${VM_APP_PATH}" \
-              FINAL_SHA="${FINAL_SHA}" \
-              VM_SERVICE_NAME="${VM_SERVICE_NAME}" \
-              ENVIRONMENT="${ENVIRONMENT}" \
-              DEPLOYMENT_ID="${{ github.run_id }}" \
-              API_KEY="${API_KEY}" \
-              DB_HOST="${DB_HOST}" \
-              bash -s
-            set -euo pipefail
-
-            cd "$VM_APP_PATH"
-
-            echo "🔧 Configuring git safe directory..."
-            git config --global --add safe.directory "$VM_APP_PATH"
-
-            echo "📥 Fetching latest code from origin..."
-            git fetch --prune --tags origin
-
-            echo "🧹 Cleaning working directory..."
-            git reset --hard
-            git clean -fd
-
-            echo "📍 Checking out commit SHA: $FINAL_SHA"
-            git checkout "$FINAL_SHA"
-
-            echo "✅ Verifying checkout succeeded..."
-            DEPLOYED_SHA=$(git rev-parse HEAD)
-            echo "Deployed SHA: $DEPLOYED_SHA"
-
-            echo "📝 Writing environment variables..."
-            cat > "$VM_APP_PATH/.env" <<ENV_EOF
-          ENVIRONMENT=$ENVIRONMENT
-          DEPLOYMENT_ID=$DEPLOYMENT_ID
-          API_KEY=$API_KEY
-          DB_HOST=$DB_HOST
-          PORT=8000
-          COMMIT_SHA=$DEPLOYED_SHA
-          ENV_EOF
-
-            echo "🔄 Restarting service..."
-            sudo systemctl restart "$VM_SERVICE_NAME"
-
-            echo "⏳ Waiting for service to initialize..."
-            sleep 3
-
-            echo "🏥 Checking health endpoint..."
-            MAX_RETRIES=10
-            RETRY_DELAY=2
-            RETRY_COUNT=0
-
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-              if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
-                echo "✅ Health check passed"
-                break
-              fi
-              RETRY_COUNT=$((RETRY_COUNT + 1))
-              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                echo "⏳ Health check attempt $RETRY_COUNT/$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-                sleep $RETRY_DELAY
-              else
-                echo "❌ Health check failed after $MAX_RETRIES attempts"
-                exit 1
-              fi
-            done
-
-            echo "✅ Deployment complete!"
+          echo "✅ Restart complete!"
           SCRIPT_EOF
 
-            echo "✅ ${ACTION} completed successfully"
-            echo "📍 SHA: ${FINAL_SHA}"
-            echo "🖥️  VM: ${VM_HOST}"
-          fi
+          echo "✅ Restart operation completed successfully"
 
-          # Set outputs
+      # STEP 7b: Execute Redeploy Operation
+      # Redeploys a specific commit SHA using centralized deploy-to-vm action
+      - name: Execute Redeploy Operation
+        id: execute_redeploy
+        if: steps.validate.outputs.should_run == 'true' && steps.validate.outputs.action == 'redeploy'
+        uses: ./.github/actions/deploy-to-vm
+        with:
+          commit-sha: ${{ steps.determine_sha.outputs.final_sha }}
+          environment: ${{ steps.validate.outputs.environment }}
+          vm-host: ${{ vars.VM_HOST }}
+          vm-user: ${{ vars.VM_USER }}
+          vm-app-path: ${{ vars.VM_APP_PATH }}
+          vm-service-name: ${{ vars.VM_SERVICE_NAME }}
+          app-port: ${{ vars.APP_PORT }}
+          api-key: ${{ secrets.API_KEY }}
+          db-host: ${{ secrets.DB_HOST }}
+          deployment-id: ${{ github.run_id }}
+
+      # STEP 7c: Execute Rollback Operation
+      # Rolls back to a previous commit SHA using centralized deploy-to-vm action
+      - name: Execute Rollback Operation
+        id: execute_rollback
+        if: steps.validate.outputs.should_run == 'true' && steps.validate.outputs.action == 'rollback'
+        uses: ./.github/actions/deploy-to-vm
+        with:
+          commit-sha: ${{ steps.determine_sha.outputs.final_sha }}
+          environment: ${{ steps.validate.outputs.environment }}
+          vm-host: ${{ vars.VM_HOST }}
+          vm-user: ${{ vars.VM_USER }}
+          vm-app-path: ${{ vars.VM_APP_PATH }}
+          vm-service-name: ${{ vars.VM_SERVICE_NAME }}
+          app-port: ${{ vars.APP_PORT }}
+          api-key: ${{ secrets.API_KEY }}
+          db-host: ${{ secrets.DB_HOST }}
+          deployment-id: ${{ github.run_id }}
+
+      # Set unified output for downstream steps
+      - name: Set Operation Status
+        id: execute_ops
+        if: always() && steps.validate.outputs.should_run == 'true'
+        run: |
           echo "health_status=deployed" >> $GITHUB_OUTPUT
-
           echo "✅ Ops operation completed successfully"
-          echo "📍 SHA: ${FINAL_SHA:-current}"
-          echo "🖥️  VM: ${VM_HOST}"
 
       # STEP 8: Post ops status comment
       # Posts result to Ops Console issue
