@@ -60,14 +60,14 @@ jobs:
       # GitHub Actions best practice: Check out repository at the start of the job
       # This ensures all composite actions under .github/actions/ are available throughout the workflow
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
       # STEP 1: Validate deployment trigger and perform all security checks
       - name: Validate deployment trigger and permissions
         id: validate
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const comment = context.payload.comment.body.trim();
@@ -255,7 +255,7 @@ jobs:
       - name: Create GitHub Deployment
         id: create_deployment
         if: steps.validate.outputs.should_deploy == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const environment = '${{ steps.validate.outputs.environment }}';
@@ -317,7 +317,7 @@ jobs:
       # Provides immediate feedback in PR about coverage requirements
       - name: Post Coverage Gate Failure
         if: always() && steps.verify_coverage.outcome == 'failure'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const errorMessage = '${{ steps.verify_coverage.outputs.error_message }}';
@@ -372,7 +372,7 @@ jobs:
       # Displays the EXACT error message from validation
       - name: Post Validation Failure
         if: always() && steps.validate.outcome == 'failure'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const errorMessage = ${{ toJSON(steps.validate.outputs.error_message) }};
@@ -400,7 +400,7 @@ jobs:
       # This ensures we deploy exactly what was validated, not what's currently on the branch
       - name: Checkout PR HEAD commit (exact SHA)
         if: steps.validate.outputs.should_deploy == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.validate.outputs.pr_sha }}
           fetch-depth: 1
@@ -470,7 +470,7 @@ jobs:
       # Informs user that same version will be redeployed with service restart
       - name: Post Redeployment Notice
         if: steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const environment = '${{ steps.validate.outputs.environment }}';
@@ -619,7 +619,7 @@ jobs:
       # This step verifies that staging was deployed first, enforcing the staging-first workflow.
       - name: Verify Staging Deployment
         if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production' && steps.check_deployed.outputs.already_deployed != 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const targetSha = '${{ steps.validate.outputs.pr_sha }}';
@@ -793,7 +793,7 @@ jobs:
       # Runs always (success or failure) if validation passed and deployment was attempted
       - name: Post Deployment Status
         if: always() && steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed != 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const environment = '${{ steps.validate.outputs.environment }}';
@@ -863,7 +863,7 @@ jobs:
       # Runs always (success/failure/cancelled) if deployment was created
       - name: Update Deployment Status
         if: always() && steps.create_deployment.outputs.deployment_id
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const deploymentId = Number('${{ steps.create_deployment.outputs.deployment_id }}');
