@@ -513,98 +513,22 @@ jobs:
       # STEP 7: Deploy to Staging Environment
       # SSH into VM, checkout validated commit SHA, and restart service
       # SECURITY: Deployment uses exact validated SHA - never branch names
+      # Using centralized deploy-to-vm composite action
       - name: Deploy to Staging
         id: deploy_staging
         if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'staging'
-        env:
-          COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
-          ENVIRONMENT: staging
-          API_KEY: ${{ secrets.API_KEY }}
-          DB_HOST: ${{ secrets.DB_HOST }}
-        run: |
-          set -euo pipefail
-
-          echo "Runner: $(hostname)"
-          echo "GitHub SHA: ${COMMIT_SHA}"
-          echo "VM: ${VM_HOST}"
-          echo ""
-          echo "🚀 Starting staging deployment..."
-          echo "📍 Commit SHA: ${COMMIT_SHA}"
-          echo "🏷️  Environment: ${ENVIRONMENT}"
-          echo "🖥️  VM Host: ${VM_HOST}"
-          echo "📁 App Path: ${VM_APP_PATH}"
-
-          # Validate SHA format before SSH
-          if ! [[ "${COMMIT_SHA}" =~ ^[a-f0-9]{40}$ ]]; then
-            echo "❌ ERROR: Invalid SHA format: ${COMMIT_SHA}"
-            exit 1
-          fi
-
-          # SSH into VM and deploy using exact commit SHA
-          echo "🔐 Connecting to VM via SSH..."
-          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
-          set -euo pipefail
-
-          cd ${VM_APP_PATH}
-
-          echo "🔧 Configuring git safe directory..."
-          git config --global --add safe.directory ${VM_APP_PATH}
-
-          echo "📥 Fetching latest code from origin..."
-          git fetch --prune --tags origin
-
-          echo "🧹 Cleaning working directory..."
-          git reset --hard
-          git clean -fd
-
-          echo "📍 Checking out commit SHA: ${COMMIT_SHA}"
-          git checkout ${COMMIT_SHA}
-
-          echo "📝 Writing environment variables..."
-          cat > ${VM_APP_PATH}/.env <<ENV_FILE
-          ENVIRONMENT=${ENVIRONMENT}
-          DEPLOYMENT_ID=${{ github.run_id }}
-          API_KEY=${API_KEY}
-          DB_HOST=${DB_HOST}
-          PORT=8000
-          COMMIT_SHA=${COMMIT_SHA}
-          ENV_FILE
-
-          echo "🔄 Restarting service..."
-          sudo systemctl restart ${VM_SERVICE_NAME}
-
-          echo "⏳ Waiting for service to initialize..."
-          sleep 3
-
-          echo "🏥 Checking health endpoint..."
-          MAX_RETRIES=10
-          RETRY_DELAY=2
-          RETRY_COUNT=0
-
-          while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
-            if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
-              echo "✅ Health check passed"
-              break
-            fi
-            RETRY_COUNT=\$((RETRY_COUNT + 1))
-            if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
-              echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-              sleep \$RETRY_DELAY
-            else
-              echo "❌ Health check failed after \$MAX_RETRIES attempts"
-              exit 1
-            fi
-          done
-
-          echo "✅ Deployment complete!"
-          EOF
-
-          # Set deployment status
-          echo "readiness_status=deployed" >> $GITHUB_OUTPUT
-
-          echo "✅ Staging deployment successful"
-          echo "📍 Commit: ${COMMIT_SHA}"
-          echo "🖥️  VM: ${VM_HOST}"
+        uses: ./.github/actions/deploy-to-vm
+        with:
+          commit-sha: ${{ steps.validate.outputs.pr_sha }}
+          environment: staging
+          vm-host: ${{ vars.VM_HOST }}
+          vm-user: ${{ vars.VM_USER }}
+          vm-app-path: ${{ vars.VM_APP_PATH }}
+          vm-service-name: ${{ vars.VM_SERVICE_NAME }}
+          app-port: ${{ vars.APP_PORT }}
+          api-key: ${{ secrets.API_KEY }}
+          db-host: ${{ secrets.DB_HOST }}
+          deployment-id: ${{ github.run_id }}
 
       # STEP 8: Verify Staging Deployment (Production Pre-Check)
       # PRODUCTION DEPLOYMENT POLICY:
@@ -696,98 +620,22 @@ jobs:
       # SSH into VM, checkout validated commit SHA, and restart service
       # SECURITY: Deployment uses exact validated SHA - never branch names
       # Production uses the same code tested in staging
+      # Using centralized deploy-to-vm composite action
       - name: Deploy to Production
         id: deploy_production
         if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production'
-        env:
-          COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
-          ENVIRONMENT: production
-          API_KEY: ${{ secrets.API_KEY }}
-          DB_HOST: ${{ secrets.DB_HOST }}
-        run: |
-          set -euo pipefail
-
-          echo "Runner: $(hostname)"
-          echo "GitHub SHA: ${COMMIT_SHA}"
-          echo "VM: ${VM_HOST}"
-          echo ""
-          echo "🚀 Starting production deployment..."
-          echo "📍 Commit SHA: ${COMMIT_SHA}"
-          echo "🏷️  Environment: ${ENVIRONMENT}"
-          echo "🖥️  VM Host: ${VM_HOST}"
-          echo "📁 App Path: ${VM_APP_PATH}"
-
-          # Validate SHA format before SSH
-          if ! [[ "${COMMIT_SHA}" =~ ^[a-f0-9]{40}$ ]]; then
-            echo "❌ ERROR: Invalid SHA format: ${COMMIT_SHA}"
-            exit 1
-          fi
-
-          # SSH into VM and deploy using exact commit SHA
-          echo "🔐 Connecting to VM via SSH..."
-          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
-          set -euo pipefail
-
-          cd ${VM_APP_PATH}
-
-          echo "🔧 Configuring git safe directory..."
-          git config --global --add safe.directory ${VM_APP_PATH}
-
-          echo "📥 Fetching latest code from origin..."
-          git fetch --prune --tags origin
-
-          echo "🧹 Cleaning working directory..."
-          git reset --hard
-          git clean -fd
-
-          echo "📍 Checking out commit SHA: ${COMMIT_SHA}"
-          git checkout ${COMMIT_SHA}
-
-          echo "📝 Writing environment variables..."
-          cat > ${VM_APP_PATH}/.env <<ENV_FILE
-          ENVIRONMENT=${ENVIRONMENT}
-          DEPLOYMENT_ID=${{ github.run_id }}
-          API_KEY=${API_KEY}
-          DB_HOST=${DB_HOST}
-          PORT=8000
-          COMMIT_SHA=${COMMIT_SHA}
-          ENV_FILE
-
-          echo "🔄 Restarting service..."
-          sudo systemctl restart ${VM_SERVICE_NAME}
-
-          echo "⏳ Waiting for service to initialize..."
-          sleep 3
-
-          echo "🏥 Checking health endpoint..."
-          MAX_RETRIES=10
-          RETRY_DELAY=2
-          RETRY_COUNT=0
-
-          while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
-            if curl -f -s http://localhost:8000/ >/dev/null 2>&1; then
-              echo "✅ Health check passed"
-              break
-            fi
-            RETRY_COUNT=\$((RETRY_COUNT + 1))
-            if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
-              echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
-              sleep \$RETRY_DELAY
-            else
-              echo "❌ Health check failed after \$MAX_RETRIES attempts"
-              exit 1
-            fi
-          done
-
-          echo "✅ Deployment complete!"
-          EOF
-
-          # Set deployment status
-          echo "readiness_status=deployed" >> $GITHUB_OUTPUT
-
-          echo "✅ Production deployment successful"
-          echo "📍 Commit: ${COMMIT_SHA}"
-          echo "🖥️  VM: ${VM_HOST}"
+        uses: ./.github/actions/deploy-to-vm
+        with:
+          commit-sha: ${{ steps.validate.outputs.pr_sha }}
+          environment: production
+          vm-host: ${{ vars.VM_HOST }}
+          vm-user: ${{ vars.VM_USER }}
+          vm-app-path: ${{ vars.VM_APP_PATH }}
+          vm-service-name: ${{ vars.VM_SERVICE_NAME }}
+          app-port: ${{ vars.APP_PORT }}
+          api-key: ${{ secrets.API_KEY }}
+          db-host: ${{ secrets.DB_HOST }}
+          deployment-id: ${{ github.run_id }}
 
       # STEP 10: Post deployment status comment to PR
       # Runs always (success or failure) if validation passed and deployment was attempted
@@ -811,8 +659,8 @@ jobs:
             // Get environment-specific outputs
             const deployStep = environment === 'staging' ? 'deploy_staging' : 'deploy_production';
             const readinessStatus = environment === 'staging'
-              ? '${{ steps.deploy_staging.outputs.readiness_status }}'
-              : '${{ steps.deploy_production.outputs.readiness_status }}';
+              ? '${{ steps.deploy_staging.outputs.deployment-status }}'
+              : '${{ steps.deploy_production.outputs.deployment-status }}';
 
             // Map readiness status to display text
             const readinessMap = {
