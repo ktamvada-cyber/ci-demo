@@ -21,12 +21,13 @@ permissions:
   checks: read          # Read check runs for coverage gate
 
 # Environment variables (workflow-level)
+# VM configuration sourced from repository variables for centralized management
+# See .github/PHASE1-SETUP.md for setup instructions
 env:
-  # VM SSH configuration
-  VM_HOST: 192.168.64.2
-  VM_USER: deploy
-  VM_APP_PATH: /var/www/voicemodal
-  VM_SERVICE_NAME: convirza-voiceagent
+  VM_HOST: ${{ vars.VM_HOST }}
+  VM_USER: ${{ vars.VM_USER }}
+  VM_APP_PATH: ${{ vars.VM_APP_PATH }}
+  VM_SERVICE_NAME: ${{ vars.VM_SERVICE_NAME }}
 
 # Concurrency control: Only ONE deployment at a time across all environments
 # Cancel any in-progress deployment when a new one is triggered
@@ -296,87 +297,11 @@ jobs:
       - name: Verify Coverage Gate
         id: verify_coverage
         if: steps.validate.outputs.should_deploy == 'true'
-        uses: actions/github-script@v7
+        uses: ./.github/actions/verify-coverage-gate
         with:
-          script: |
-            const prSha = '${{ steps.validate.outputs.pr_sha }}';
-            const requiredCheckName = 'test-coverage';  // Must match job name in test-coverage.yml
-
-            core.info(`🔍 Checking coverage gate for SHA: ${prSha}`);
-
-            // Query ALL check runs on this SHA (do not use check_name filter to avoid API quirks)
-            const { data: allChecks } = await github.rest.checks.listForRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: prSha
-            });
-
-            core.info(`Found ${allChecks.total_count} total check runs for SHA ${prSha.substring(0, 7)}`);
-
-            // Filter to find the coverage check by exact name match
-            const coverageChecks = allChecks.check_runs.filter(check => check.name === requiredCheckName);
-
-            core.info(`Found ${coverageChecks.length} check runs with name="${requiredCheckName}"`);
-
-            // Verify coverage check exists
-            if (coverageChecks.length === 0) {
-              const errorMsg = `❌ COVERAGE GATE FAILED: No "${requiredCheckName}" check found for SHA ${prSha.substring(0, 7)}.\n\nCoverage tests must run before deployment.`;
-              core.setOutput('error_message', errorMsg);
-              core.setOutput('target_sha', prSha);
-              core.setFailed(errorMsg);
-              return { passed: false };
-            }
-
-            // Sort by completed_at (or started_at if not completed) descending to get most recent
-            const sortedChecks = coverageChecks.sort((a, b) => {
-              const timeA = new Date(a.completed_at || a.started_at || 0);
-              const timeB = new Date(b.completed_at || b.started_at || 0);
-              return timeB - timeA; // Newest first
-            });
-
-            // Get the most recent check run
-            const coverageCheck = sortedChecks[0];
-            core.info(`Using check run ID ${coverageCheck.id} (${coverageCheck.completed_at || coverageCheck.started_at})`);
-            core.info(`Check status: ${coverageCheck.status}, conclusion: ${coverageCheck.conclusion}`);
-
-            // Verify check is completed
-            if (coverageCheck.status !== 'completed') {
-              const statusMsg = coverageCheck.status === 'in_progress' ? 'still running' : coverageCheck.status;
-              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check is ${statusMsg}. Wait for coverage tests to complete.\n\nCheck: ${coverageCheck.html_url}`;
-              core.setOutput('error_message', errorMsg);
-              core.setOutput('target_sha', prSha);
-              core.setOutput('check_url', coverageCheck.html_url);
-              core.setFailed(errorMsg);
-              return { passed: false };
-            }
-
-            // Verify check passed
-            if (coverageCheck.conclusion !== 'success') {
-              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check ${coverageCheck.conclusion}. Coverage must be ≥70% to deploy.\n\nCheck: ${coverageCheck.html_url}`;
-              core.setOutput('error_message', errorMsg);
-              core.setOutput('target_sha', prSha);
-              core.setOutput('check_url', coverageCheck.html_url);
-              core.setFailed(errorMsg);
-              return { passed: false };
-            }
-
-            // Extract coverage percentage from check run output (if available)
-            let coveragePct = 'N/A';
-            if (coverageCheck.output && coverageCheck.output.title) {
-              // Parse coverage from title like "✅ Coverage 74.0% (≥70%)"
-              const match = coverageCheck.output.title.match(/Coverage\s+([\d.]+)%/);
-              if (match) {
-                coveragePct = match[1];
-                core.info(`Extracted coverage: ${coveragePct}%`);
-              }
-            }
-
-            core.info(`✅ Coverage gate passed`);
-            core.setOutput('coverage_check_url', coverageCheck.html_url);
-            core.setOutput('coverage_pct', coveragePct);
-            core.setOutput('target_sha', prSha);
-
-            return { passed: true, coveragePct };
+          target-sha: ${{ steps.validate.outputs.pr_sha }}
+          action-type: 'deployment'
+          github-token: ${{ github.token }}
 
       # STEP 1.7: Post coverage gate failure message
       # Runs if coverage gate check failed
@@ -496,23 +421,11 @@ jobs:
       # SECURITY: SSH private key stored as GitHub secret
       - name: Setup SSH Key for VM Access
         if: steps.validate.outputs.should_deploy == 'true'
-        run: |
-          set -euo pipefail
-
-          echo "🔐 Configuring SSH authentication..."
-
-          # Create .ssh directory with correct permissions
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-
-          # Install SSH private key from secrets
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-
-          # Add VM host to known_hosts to avoid host verification prompt
-          ssh-keyscan -H ${{ env.VM_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
-
-          echo "✅ SSH key configured for ${VM_USER}@${VM_HOST}"
+        uses: ./.github/actions/setup-ssh
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          vm-host: ${{ env.VM_HOST }}
+          vm-user: ${{ env.VM_USER }}
 
       # STEP 5: Check if same version is already deployed
       # Skip deployment if the exact same SHA is already deployed on VM
@@ -998,75 +911,7 @@ jobs:
       # Only runs if the deployment was successful (not skipped/failed)
       - name: Update Deployment History Wiki
         if: success() && steps.create_deployment.outputs.deployment_id
-        uses: actions/github-script@v7
+        uses: ./.github/actions/update-deployment-wiki
         with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-
-            // Import and run the wiki generator script
-            const scriptPath = path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/update-deployment-wiki.js');
-            const generateWikiContent = require(scriptPath);
-            const markdownContent = await generateWikiContent({ github, context, core });
-
-            // Clone wiki repository
-            const wikiUrl = `https://x-access-token:${{ secrets.WIKI_TOKEN }}@github.com/${{ github.repository }}.wiki.git`;
-            const wikiDir = path.join(process.env.RUNNER_TEMP, 'wiki');
-
-            core.info('📚 Cloning wiki repository...');
-
-            try {
-              // Clone wiki (or initialize if it doesn't exist)
-              await exec.exec('git', ['clone', wikiUrl, wikiDir], {
-                ignoreReturnCode: true
-              });
-
-              // If wiki doesn't exist, initialize it
-              if (!fs.existsSync(path.join(wikiDir, '.git'))) {
-                core.info('Wiki does not exist yet, initializing...');
-                fs.mkdirSync(wikiDir, { recursive: true });
-                await exec.exec('git', ['init'], { cwd: wikiDir });
-                await exec.exec('git', ['remote', 'add', 'origin', wikiUrl], { cwd: wikiDir });
-              }
-
-              // Configure git
-              await exec.exec('git', ['config', 'user.name', 'github-actions[bot]'], { cwd: wikiDir });
-              await exec.exec('git', ['config', 'user.email', 'github-actions[bot]@users.noreply.github.com'], { cwd: wikiDir });
-
-              // Write the markdown file
-              const wikiFilePath = path.join(wikiDir, 'Deployment-History.md');
-              fs.writeFileSync(wikiFilePath, markdownContent, 'utf8');
-              core.info('✅ Deployment-History.md written successfully');
-
-              // Commit and push
-              await exec.exec('git', ['add', 'Deployment-History.md'], { cwd: wikiDir });
-
-              // Check if there are changes to commit
-              let hasChanges = false;
-              await exec.exec('git', ['diff', '--staged', '--quiet'], {
-                cwd: wikiDir,
-                ignoreReturnCode: true,
-                listeners: {
-                  errline: () => { hasChanges = true; }
-                }
-              });
-
-              // If git diff exits with non-zero, there are changes
-              const { exitCode } = await exec.getExecOutput('git', ['diff', '--staged', '--quiet'], {
-                cwd: wikiDir,
-                ignoreReturnCode: true
-              });
-
-              if (exitCode !== 0) {
-                core.info('📝 Changes detected, committing...');
-                await exec.exec('git', ['commit', '-m', 'Update deployment history'], { cwd: wikiDir });
-                await exec.exec('git', ['push', 'origin', 'HEAD'], { cwd: wikiDir });
-                core.info('✅ Wiki updated successfully');
-              } else {
-                core.info('ℹ️  No changes to wiki content');
-              }
-
-            } catch (error) {
-              core.warning(`Failed to update wiki: ${error.message}`);
-              core.info('This is non-critical - deployment was still successful');
-            }
+          wiki-token: ${{ secrets.WIKI_TOKEN }}
+          github-repository: ${{ github.repository }}
