@@ -290,6 +290,16 @@ jobs:
               log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             });
 
+      # STEP 1.5.1: Checkout repository for composite actions
+      # Composite actions require the repository code to be present in the runner workspace
+      # This is a minimal checkout (fetch-depth: 1) just to access .github/actions/*
+      # The actual deployment checkout happens later at the exact PR SHA
+      - name: Checkout repository for composite actions
+        if: steps.validate.outputs.should_deploy == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       # STEP 1.6: Verify Coverage Gate Passed
       # COVERAGE GATE: Block deployment if coverage check missing or failed
       # Queries GitHub Checks API for "test-coverage" check run (job name) on the PR SHA
