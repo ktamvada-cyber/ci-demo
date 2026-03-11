@@ -317,6 +317,142 @@ jobs:
               body: comment
             });
 
+      # STEP 1.8: Verify Staging Deployment (Production Pre-Check)
+      # PRODUCTION DEPLOYMENT POLICY:
+      # Production deployments should only proceed after the same SHA has been tested in staging.
+      # This step verifies staging deployment BEFORE asking for approval
+      # This prevents wasting reviewer time on deployments that will fail the staging-first check
+      - name: Verify Staging Deployment (Production Only)
+        id: verify_staging
+        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const targetSha = '${{ steps.validate.outputs.pr_sha }}';
+
+            core.info(`🔍 Verifying staging deployment for SHA: ${targetSha}`);
+            core.info(`   Querying GitHub Deployments API for staging environment...`);
+
+            // Query all deployments for staging environment
+            const { data: deployments } = await github.rest.repos.listDeployments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              environment: 'staging',
+              sha: targetSha,
+              per_page: 100
+            });
+
+            core.info(`   Found ${deployments.length} staging deployment(s) for SHA ${targetSha.substring(0, 7)}`);
+
+            if (deployments.length === 0) {
+              const errorMsg = `❌ STAGING VERIFICATION FAILED: No staging deployment found for SHA ${targetSha.substring(0, 7)}\n\n` +
+                `**Production Deployment Policy:**\n` +
+                `This SHA must be deployed to staging first before production deployment.\n\n` +
+                `**Required Action:**\n` +
+                `1. Deploy this SHA to staging first with: [staging]\n` +
+                `2. Verify staging deployment is successful\n` +
+                `3. Then deploy to production with: [prod]\n\n` +
+                `This ensures what is tested in staging is what gets deployed to production.`;
+              core.setOutput('error_message', errorMsg);
+              core.setFailed(errorMsg);
+              return;
+            }
+
+            // Get deployment statuses for each deployment and check for success
+            let hasSuccessfulDeployment = false;
+
+            for (const deployment of deployments) {
+              const { data: statuses } = await github.rest.repos.listDeploymentStatuses({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: deployment.id,
+                per_page: 100
+              });
+
+              // Sort by created_at descending to get most recent status first
+              const sortedStatuses = statuses.sort((a, b) =>
+                new Date(b.created_at) - new Date(a.created_at)
+              );
+
+              if (sortedStatuses.length > 0 && sortedStatuses[0].state === 'success') {
+                hasSuccessfulDeployment = true;
+                core.info(`✅ Found successful staging deployment: ID ${deployment.id}`);
+                core.info(`   Status: ${sortedStatuses[0].state}`);
+                core.info(`   Created: ${sortedStatuses[0].created_at}`);
+                break;
+              }
+            }
+
+            if (!hasSuccessfulDeployment) {
+              const errorMsg = `❌ STAGING VERIFICATION FAILED: SHA ${targetSha.substring(0, 7)} found in staging but no successful deployment\n\n` +
+                `**Status:** Staging deployment exists but did not complete successfully\n\n` +
+                `**Required Action:**\n` +
+                `1. Check staging deployment logs for errors\n` +
+                `2. Fix any issues and redeploy to staging\n` +
+                `3. Verify staging deployment completes successfully\n` +
+                `4. Then retry production deployment with: [prod]\n\n` +
+                `Production deployments require a successful staging deployment first.`;
+              core.setOutput('error_message', errorMsg);
+              core.setFailed(errorMsg);
+              return;
+            }
+
+            core.info(`✅ Staging verification passed`);
+            core.info(`📍 Proceeding with production deployment of: ${targetSha}`)
+
+      # STEP 1.9: Post staging verification failure message
+      # Runs if staging verification check failed
+      # Provides immediate feedback in PR about staging-first policy
+      - name: Post Staging Verification Failure
+        if: always() && steps.verify_staging.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errorMessage = '${{ steps.verify_staging.outputs.error_message }}';
+            const targetSha = '${{ steps.validate.outputs.pr_sha }}';
+
+            const comment = `### ❌ Production Deployment Blocked - Staging Verification Failed
+
+            **Error Details:**
+
+            ${errorMessage || '❌ Staging verification failed - see workflow logs'}
+
+            ---
+
+            #### 🚦 Staging-First Policy
+
+            **Why this policy exists:**
+            - Ensures consistency: What is tested in staging is what gets deployed to production
+            - Prevents untested code from reaching production
+            - Provides a safety net for catching issues before production
+
+            #### 🔧 How to Fix
+
+            1. Deploy this commit to staging first:
+               \`\`\`
+               [staging]
+               \`\`\`
+
+            2. Verify staging deployment succeeds and test your changes
+
+            3. Once staging is verified, deploy to production:
+               \`\`\`
+               [prod]
+               \`\`\`
+
+            **Commit SHA:** \`${targetSha}\`
+
+            ---
+            📋 **View Deployment Workflow:** [Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
       # STEP 2: Post validation failure message
       # Runs if validation step completed but deployment was rejected
       # Provides immediate feedback in PR without checking Actions tab
@@ -554,93 +690,12 @@ jobs:
           db-host: ${{ secrets.DB_HOST }}
           deployment-id: ${{ github.run_id }}
 
-      # STEP 8: Verify Staging Deployment (Production Pre-Check)
-      # PRODUCTION DEPLOYMENT POLICY:
-      # Production deployments should only proceed after the same SHA has been tested in staging.
-      # This ensures:
-      #
-      # 1. CONSISTENCY: What is tested in staging is what gets deployed to production
-      # 2. SECURITY: Untested code doesn't reach production
-      # 3. COMPLIANCE: Production deployments follow proper testing workflow
-      # 4. RELIABILITY: "What you test is what you deploy"
-      #
-      # This step verifies that staging was deployed first, enforcing the staging-first workflow.
-      - name: Verify Staging Deployment
-        if: needs.validate.outputs.environment == 'production' && steps.check_deployed.outputs.already_deployed != 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const targetSha = '${{ needs.validate.outputs.pr_sha }}';
+      # NOTE: Staging Verification Check Moved to validate Job
+      # The staging-first verification now runs in the validate job BEFORE environment protection.
+      # This prevents wasting reviewer time by asking for approval before verifying the
+      # deployment can actually proceed. See validate job STEP 1.8 for the verification logic.
 
-            core.info(`🔍 Verifying staging deployment for SHA: ${targetSha}`);
-            core.info(`   Querying GitHub Deployments API for staging environment...`);
-
-            // Query all deployments for staging environment
-            const { data: deployments } = await github.rest.repos.listDeployments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              environment: 'staging',
-              sha: targetSha,
-              per_page: 100
-            });
-
-            core.info(`   Found ${deployments.length} staging deployment(s) for SHA ${targetSha.substring(0, 7)}`);
-
-            if (deployments.length === 0) {
-              const errorMsg = `❌ STAGING VERIFICATION FAILED: No staging deployment found for SHA ${targetSha.substring(0, 7)}\n\n` +
-                `**Production Deployment Policy:**\n` +
-                `This SHA must be deployed to staging first before production deployment.\n\n` +
-                `**Required Action:**\n` +
-                `1. Deploy this SHA to staging first with: [staging]\n` +
-                `2. Verify staging deployment is successful\n` +
-                `3. Then deploy to production with: [prod]\n\n` +
-                `This ensures what is tested in staging is what gets deployed to production.`;
-              core.setFailed(errorMsg);
-              throw new Error(errorMsg);
-            }
-
-            // Get deployment statuses for each deployment and check for success
-            let hasSuccessfulDeployment = false;
-
-            for (const deployment of deployments) {
-              const { data: statuses } = await github.rest.repos.listDeploymentStatuses({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                deployment_id: deployment.id,
-                per_page: 100
-              });
-
-              // Sort by created_at descending to get most recent status first
-              const sortedStatuses = statuses.sort((a, b) =>
-                new Date(b.created_at) - new Date(a.created_at)
-              );
-
-              if (sortedStatuses.length > 0 && sortedStatuses[0].state === 'success') {
-                hasSuccessfulDeployment = true;
-                core.info(`✅ Found successful staging deployment: ID ${deployment.id}`);
-                core.info(`   Status: ${sortedStatuses[0].state}`);
-                core.info(`   Created: ${sortedStatuses[0].created_at}`);
-                break;
-              }
-            }
-
-            if (!hasSuccessfulDeployment) {
-              const errorMsg = `❌ STAGING VERIFICATION FAILED: SHA ${targetSha.substring(0, 7)} found in staging but no successful deployment\n\n` +
-                `**Status:** Staging deployment exists but did not complete successfully\n\n` +
-                `**Required Action:**\n` +
-                `1. Check staging deployment logs for errors\n` +
-                `2. Fix any issues and redeploy to staging\n` +
-                `3. Verify staging deployment completes successfully\n` +
-                `4. Then retry production deployment with: [prod]\n\n` +
-                `Production deployments require a successful staging deployment first.`;
-              core.setFailed(errorMsg);
-              throw new Error(errorMsg);
-            }
-
-            core.info(`✅ Staging verification passed`);
-            core.info(`📍 Proceeding with production deployment of: ${targetSha}`)
-
-      # STEP 9: Deploy to Production Environment
+      # STEP 8: Deploy to Production Environment
       # SSH into VM, checkout validated commit SHA, and restart service
       # SECURITY: Deployment uses exact validated SHA - never branch names
       # Production uses the same code tested in staging
@@ -661,7 +716,7 @@ jobs:
           db-host: ${{ secrets.DB_HOST }}
           deployment-id: ${{ github.run_id }}
 
-      # STEP 10: Post deployment status comment to PR
+      # STEP 9: Post deployment status comment to PR
       # Runs always (success or failure) if deployment was attempted
       - name: Post Deployment Status
         if: always() && steps.check_deployed.outputs.already_deployed != 'true'
@@ -731,7 +786,7 @@ jobs:
               body: comment
             });
 
-      # STEP 11: Update GitHub Deployment Status
+      # STEP 10: Update GitHub Deployment Status
       # Updates the deployment record created in step 1 with final status
       # Runs always (success/failure/cancelled) if deployment was created
       - name: Update Deployment Status
@@ -788,7 +843,7 @@ jobs:
 
             core.info(`Deployment status updated: ${state}`);
 
-      # STEP 12: Update Deployment History Wiki
+      # STEP 11: Update Deployment History Wiki
       # Updates the GitHub Wiki with deployment history after successful deployment
       # Only runs if the deployment was successful (not skipped/failed)
       - name: Update Deployment History Wiki

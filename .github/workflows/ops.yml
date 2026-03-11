@@ -896,7 +896,152 @@ jobs:
               body: comment
             });
 
-      # STEP 6: Create GitHub Deployment record
+      # STEP 5.7: Verify Staging Deployment (Production Redeploy Pre-Check)
+      # PRODUCTION DEPLOYMENT POLICY:
+      # Production redeploys should only proceed after the same SHA has been tested in staging.
+      # This enforces the staging-first workflow for ops operations
+      - name: Verify Staging Deployment (Production Redeploy Only)
+        id: verify_staging
+        if: |
+          needs.validate.outputs.should_run == 'true' &&
+          needs.validate.outputs.environment == 'production' &&
+          needs.validate.outputs.action == 'redeploy' &&
+          steps.determine_sha.outputs.final_sha != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const targetSha = '${{ steps.determine_sha.outputs.final_sha }}';
+
+            core.info(`🔍 Verifying staging deployment for SHA: ${targetSha}`);
+            core.info(`   Querying GitHub Deployments API for staging environment...`);
+
+            // Query all deployments for staging environment
+            const { data: deployments } = await github.rest.repos.listDeployments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              environment: 'staging',
+              sha: targetSha,
+              per_page: 100
+            });
+
+            core.info(`   Found ${deployments.length} staging deployment(s) for SHA ${targetSha.substring(0, 7)}`);
+
+            if (deployments.length === 0) {
+              const errorMsg = `❌ STAGING VERIFICATION FAILED: No staging deployment found for SHA ${targetSha.substring(0, 7)}\n\n` +
+                `**Production Deployment Policy:**\n` +
+                `This SHA must be deployed to staging first before production redeploy.\n\n` +
+                `**Required Action:**\n` +
+                `1. Deploy this SHA to staging first (via PR or ops command)\n` +
+                `2. Verify staging deployment is successful\n` +
+                `3. Then redeploy to production\n\n` +
+                `This ensures what is tested in staging is what gets deployed to production.`;
+              core.setOutput('error_message', errorMsg);
+              core.setFailed(errorMsg);
+              return;
+            }
+
+            // Get deployment statuses for each deployment and check for success
+            let hasSuccessfulDeployment = false;
+
+            for (const deployment of deployments) {
+              const { data: statuses } = await github.rest.repos.listDeploymentStatuses({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: deployment.id,
+                per_page: 100
+              });
+
+              // Sort by created_at descending to get most recent status first
+              const sortedStatuses = statuses.sort((a, b) =>
+                new Date(b.created_at) - new Date(a.created_at)
+              );
+
+              if (sortedStatuses.length > 0 && sortedStatuses[0].state === 'success') {
+                hasSuccessfulDeployment = true;
+                core.info(`✅ Found successful staging deployment: ID ${deployment.id}`);
+                core.info(`   Status: ${sortedStatuses[0].state}`);
+                core.info(`   Created: ${sortedStatuses[0].created_at}`);
+                break;
+              }
+            }
+
+            if (!hasSuccessfulDeployment) {
+              const errorMsg = `❌ STAGING VERIFICATION FAILED: SHA ${targetSha.substring(0, 7)} found in staging but no successful deployment\n\n` +
+                `**Status:** Staging deployment exists but did not complete successfully\n\n` +
+                `**Required Action:**\n` +
+                `1. Check staging deployment logs for errors\n` +
+                `2. Fix any issues and redeploy to staging\n` +
+                `3. Verify staging deployment completes successfully\n` +
+                `4. Then retry production redeploy\n\n` +
+                `Production redeploys require a successful staging deployment first.`;
+              core.setOutput('error_message', errorMsg);
+              core.setFailed(errorMsg);
+              return;
+            }
+
+            core.info(`✅ Staging verification passed`);
+            core.info(`📍 Proceeding with production redeploy of: ${targetSha}`)
+
+      # STEP 5.8: Post staging verification failure message
+      # Runs if staging verification check failed for production redeploy
+      # Provides immediate feedback to Ops Console
+      - name: Post Staging Verification Failure (Ops)
+        if: always() && steps.verify_staging.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errorMessage = '${{ steps.verify_staging.outputs.error_message }}';
+            const targetSha = '${{ steps.determine_sha.outputs.final_sha }}';
+            const isWorkflowDispatch = context.eventName === 'workflow_dispatch';
+            const opsIssueNumber = Number(process.env.OPS_ISSUE_NUMBER);
+
+            const comment = `### ❌ Production Redeploy Blocked - Staging Verification Failed
+
+            **Error Details:**
+
+            ${errorMessage || '❌ Staging verification failed - see workflow logs'}
+
+            ---
+
+            #### 🚦 Staging-First Policy
+
+            **Why this policy exists:**
+            - Ensures consistency: What is tested in staging is what gets deployed to production
+            - Prevents untested code from reaching production
+            - Provides a safety net for catching issues before production
+
+            #### 🔧 How to Fix
+
+            1. Deploy this SHA to staging first:
+               \`\`\`
+               [staging-redeploy sha=${targetSha.substring(0, 7)}]
+               \`\`\`
+
+            2. Verify staging deployment succeeds and test your changes
+
+            3. Once staging is verified, redeploy to production:
+               \`\`\`
+               [prod-redeploy sha=${targetSha.substring(0, 7)} confirm=yes]
+               \`\`\`
+
+            **Target SHA:** \`${targetSha}\`
+
+            ---
+            📋 **View Ops Workflow:** [Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `;
+
+            // For workflow_dispatch, post to ops console
+            // For issue_comment, post to the same issue (which should be ops console)
+            const targetIssue = isWorkflowDispatch ? opsIssueNumber : context.issue.number;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: targetIssue,
+              body: comment
+            });
+
+      # STEP 7: Create GitHub Deployment record
       # Creates a deployment tied to the target SHA for tracking
       - name: Create GitHub Deployment
         id: create_deployment
