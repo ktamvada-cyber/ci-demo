@@ -597,7 +597,7 @@ jobs:
           vm-user: ${{ env.VM_USER }}
 
       # STEP 5: Check if same version is already deployed
-      # Skip deployment if the exact same SHA is already deployed on VM
+      # Skip deployment if the exact same SHA AND ENVIRONMENT are already deployed on VM
       # Prevents unnecessary downtime and service restarts
       - name: Check Already Deployed
         id: check_deployed
@@ -609,20 +609,31 @@ jobs:
 
           echo "🔍 Checking current deployment on VM..."
 
-          # SSH into VM and check currently deployed SHA
+          # SSH into VM and check currently deployed SHA and ENVIRONMENT
           CURRENT_SHA=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
             "git -C ${VM_APP_PATH} rev-parse HEAD 2>/dev/null || echo unknown" 2>/dev/null || echo "unknown")
 
-          echo "📍 Current SHA: ${CURRENT_SHA}"
-          echo "📍 Target SHA:  ${COMMIT_SHA}"
+          CURRENT_ENV=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+            "grep '^ENVIRONMENT=' ${VM_APP_PATH}/.env 2>/dev/null | cut -d'=' -f2 || echo unknown" 2>/dev/null || echo "unknown")
 
-          if [ "$CURRENT_SHA" = "$COMMIT_SHA" ]; then
+          echo "📍 Current SHA:         ${CURRENT_SHA}"
+          echo "📍 Target SHA:          ${COMMIT_SHA}"
+          echo "📍 Current Environment: ${CURRENT_ENV}"
+          echo "📍 Target Environment:  ${ENVIRONMENT}"
+
+          if [ "$CURRENT_SHA" = "$COMMIT_SHA" ] && [ "$CURRENT_ENV" = "$ENVIRONMENT" ]; then
             echo "already_deployed=true" >> $GITHUB_OUTPUT
-            echo "✅ Same version already deployed: ${COMMIT_SHA}"
+            echo "✅ Same version and environment already deployed: ${COMMIT_SHA} (${ENVIRONMENT})"
             echo "⏭️  Skipping deployment (no changes)"
           else
             echo "already_deployed=false" >> $GITHUB_OUTPUT
-            echo "🔄 Different version detected - proceeding with deployment"
+            if [ "$CURRENT_SHA" != "$COMMIT_SHA" ]; then
+              echo "🔄 Different SHA detected - proceeding with deployment"
+            elif [ "$CURRENT_ENV" != "$ENVIRONMENT" ]; then
+              echo "🔄 Different environment detected - proceeding with deployment"
+            else
+              echo "🔄 Proceeding with deployment"
+            fi
           fi
 
       # STEP 6: Post redeployment notification (when same SHA is already deployed)
