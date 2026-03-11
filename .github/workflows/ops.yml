@@ -82,15 +82,24 @@ concurrency:
 
 jobs:
   # JOB 1: VALIDATION - Runs FIRST without environment protection
-  # Checks authorization, command syntax, and safety requirements BEFORE asking for approval
-  # This prevents wasting reviewer time on ops commands that will fail validation
+  # Validates ops trigger, performs authorization checks, and runs ALL verification steps
+  # This prevents wasting reviewer time on operations that will fail verification
+  #
+  # Checks performed (in order):
+  # 1. Command syntax validation
+  # 2. Authorization check (AUTHORIZED_STAGING_USERS / AUTHORIZED_PRODUCTION_USERS)
+  # 3. Ref/SHA resolution (convert tags/refs to commit SHAs)
+  # 4. Coverage gate verification (ensure target SHA has passing tests)
+  # 5. Staging-first verification (production redeploys require staging deployment)
+  #
+  # Only after ALL checks pass does the execute-ops job run (with environment protection)
   validate:
     # Security: Only run on non-PR issues (ops console) or manual workflow_dispatch
     # This prevents ops workflow from triggering on PR comments (those should use deploy.yml)
     # For issue comments, ONLY run on the designated Ops Console issue
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && github.event.issue.number == vars.OPS_ISSUE_NUMBER)
     runs-on: self-hosted
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     # Outputs for the execute-ops job
     outputs:
@@ -101,6 +110,10 @@ jobs:
       steps: ${{ steps.validate.outputs.steps }}
       confirm: ${{ steps.validate.outputs.confirm }}
       requester: ${{ steps.validate.outputs.requester }}
+      # Additional outputs from verification steps
+      resolved_sha: ${{ steps.resolve_sha.outputs.resolved_sha }}
+      final_sha: ${{ steps.determine_sha.outputs.final_sha }}
+      current_sha: ${{ steps.determine_current.outputs.current_sha }}
 
     steps:
       # STEP 0: Checkout repository for composite actions
@@ -110,6 +123,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      # STEP 0.5: Setup SSH Key for VM Access
+      # Required for: restart operations and rollback-by-steps
+      # These operations need to query VM for current SHA during validation
+      - name: Setup SSH Key for VM Access
+        uses: ./.github/actions/setup-ssh
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          vm-host: ${{ env.VM_HOST }}
+          vm-user: ${{ env.VM_USER }}
 
       # STEP 1: Validate and parse ops trigger
       # Detects trigger source (workflow_dispatch vs issue_comment)
@@ -349,43 +372,18 @@ jobs:
               body: comment
             });
 
-  # JOB 2: EXECUTE-OPS - Runs AFTER validation passes
-  # This job has environment protection (approval for production)
-  # Approval is only requested AFTER authorization checks pass
-  execute-ops:
-    needs: validate
-    if: needs.validate.outputs.should_run == 'true'
-    runs-on: self-hosted
-
-    # GitHub Environment protection (requires manual approval for production if configured)
-    # Dynamic environment selection based on validation output
-    # NOTE: This approval happens AFTER authorization checks in validate job
-    environment:
-      name: ${{ needs.validate.outputs.environment }}
-      url: ${{ format('http://{0}/{1}', vars.VM_HOST, needs.validate.outputs.environment) }}
-
-    # Prevent runaway operations - fail if job exceeds 15 minutes
-    timeout-minutes: 15
-
-    steps:
-      # STEP 0: Checkout repository for composite actions
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      # STEP 1: Resolve Ref/Tag to SHA
+      # STEP 3: Resolve Ref/Tag to SHA
       # If target_sha is provided, resolve it to a 40-char commit SHA
       # Accepts: 40-char SHA (pass-through), tags (v1.2.3), branches (main), or refs (refs/tags/v1.0.0)
       # This ensures the coverage gate always checks a real commit SHA
       - name: Resolve Ref to SHA
         id: resolve_sha
-        if: needs.validate.outputs.target_sha != ''
+        if: steps.validate.outputs.target_sha != ''
         uses: actions/github-script@v7
         with:
           script: |
-            const inputRef = '${{ needs.validate.outputs.target_sha }}';
-            const action = '${{ needs.validate.outputs.action }}';
+            const inputRef = '${{ steps.validate.outputs.target_sha }}';
+            const action = '${{ steps.validate.outputs.action }}';
 
             core.info(`🔍 Resolving ref to SHA: ${inputRef}`);
 
@@ -402,7 +400,6 @@ jobs:
 
             try {
               // Try to resolve as a ref (handles tags, branches, etc.)
-              // First try refs/tags/<input> (most common for version tags)
               let resolvedSha = '';
               let refType = '';
 
@@ -413,8 +410,6 @@ jobs:
                   ref: `tags/${inputRef}`
                 });
 
-                // For annotated tags, tagRef.object.sha is the tag object SHA
-                // We need to dereference to get the commit SHA
                 if (tagRef.object.type === 'tag') {
                   const { data: tagObject } = await github.rest.git.getTag({
                     owner: context.repo.owner,
@@ -430,7 +425,6 @@ jobs:
 
                 core.info(`✅ Resolved tag "${inputRef}" (${refType}) to commit SHA: ${resolvedSha}`);
               } catch (tagError) {
-                // Tag not found, try as a branch
                 try {
                   const { data: branchRef } = await github.rest.git.getRef({
                     owner: context.repo.owner,
@@ -441,7 +435,6 @@ jobs:
                   refType = 'branch';
                   core.info(`✅ Resolved branch "${inputRef}" to commit SHA: ${resolvedSha}`);
                 } catch (branchError) {
-                  // Not a tag or branch, try as a raw ref (e.g., refs/pull/123/head)
                   try {
                     const { data: rawRef } = await github.rest.git.getRef({
                       owner: context.repo.owner,
@@ -452,7 +445,6 @@ jobs:
                     refType = 'raw ref';
                     core.info(`✅ Resolved ref "${inputRef}" to commit SHA: ${resolvedSha}`);
                   } catch (refError) {
-                    // Last resort: try to get commit directly (handles short SHAs)
                     try {
                       const { data: commit } = await github.rest.repos.getCommit({
                         owner: context.repo.owner,
@@ -473,7 +465,6 @@ jobs:
                 }
               }
 
-              // Verify resolved SHA is a valid 40-char hex string
               if (!/^[a-f0-9]{40}$/.test(resolvedSha)) {
                 const errorMsg = `❌ REF RESOLUTION FAILED: Resolved SHA "${resolvedSha}" is not a valid 40-char hex string.`;
                 core.setOutput('error_message', errorMsg);
@@ -504,8 +495,7 @@ jobs:
               return { error: errorMsg };
             }
 
-      # STEP 2.6: Post ref resolution failure message
-      # Runs if ref resolution failed
+      # STEP 4: Post ref resolution failure message
       - name: Post Ref Resolution Failure
         if: always() && steps.resolve_sha.outcome == 'failure'
         uses: actions/github-script@v7
@@ -515,7 +505,7 @@ jobs:
             const originalRef = '${{ steps.resolve_sha.outputs.original_ref }}';
             const opsIssueNumber = Number(process.env.OPS_ISSUE_NUMBER);
             const isWorkflowDispatch = context.eventName === 'workflow_dispatch';
-            const action = '${{ needs.validate.outputs.action }}';
+            const action = '${{ steps.validate.outputs.action }}';
 
             const comment = `### ❌ ${action.charAt(0).toUpperCase() + action.slice(1)} Blocked - Ref Resolution Failed
 
@@ -541,8 +531,6 @@ jobs:
             📋 **View Ops Workflow:** [Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
             `;
 
-            // For workflow_dispatch, try to post to ops console
-            // For issue_comment, post to the same issue (which should be ops console)
             const targetIssue = isWorkflowDispatch ? opsIssueNumber : context.issue.number;
 
             await github.rest.issues.createComment({
@@ -552,13 +540,16 @@ jobs:
               body: comment
             });
 
+  # JOB 2: EXECUTE-OPS - Runs AFTER validation passes
+  # This job has environment protection (approval for production)
+  # Approval is only requested AFTER authorization checks pass
       # STEP 3: Determine current SHA from VM deployment
       # Query VM to get currently deployed commit SHA
       - name: Determine Current SHA
         id: determine_current
-        if: needs.validate.outputs.should_run == 'true'
+        if: steps.validate.outputs.should_run == 'true'
         env:
-          ENVIRONMENT: ${{ needs.validate.outputs.environment }}
+          ENVIRONMENT: ${{ steps.validate.outputs.environment }}
         run: |
           set -euo pipefail
 
@@ -586,15 +577,15 @@ jobs:
       - name: Compute Rollback Target (GitHub Deployments API)
         id: compute_rollback_api
         if: |
-          needs.validate.outputs.should_run == 'true' &&
-          needs.validate.outputs.action == 'rollback' &&
-          needs.validate.outputs.target_sha == '' &&
+          steps.validate.outputs.should_run == 'true' &&
+          steps.validate.outputs.action == 'rollback' &&
+          steps.validate.outputs.target_sha == '' &&
           steps.resolve_sha.outcome == 'skipped'
         uses: actions/github-script@v7
         with:
           script: |
-            const environment = '${{ needs.validate.outputs.environment }}';
-            const stepsBack = Number('${{ needs.validate.outputs.steps }}');
+            const environment = '${{ steps.validate.outputs.environment }}';
+            const stepsBack = Number('${{ steps.validate.outputs.steps }}');
             const currentSha = '${{ steps.determine_current.outputs.current_sha }}';
 
             core.info(`🔍 Querying GitHub Deployments API for ${environment} history`);
@@ -744,13 +735,13 @@ jobs:
       # For rollback: use resolved SHA (from tag/ref) or GitHub Deployments API result
       - name: Determine Target SHA
         id: determine_sha
-        if: needs.validate.outputs.should_run == 'true'
+        if: steps.validate.outputs.should_run == 'true'
         env:
-          ACTION: ${{ needs.validate.outputs.action }}
-          ENVIRONMENT: ${{ needs.validate.outputs.environment }}
-          TARGET_SHA: ${{ steps.resolve_sha.outputs.resolved_sha || needs.validate.outputs.target_sha }}
-          ORIGINAL_REF: ${{ steps.resolve_sha.outputs.original_ref || needs.validate.outputs.target_sha }}
-          STEPS: ${{ needs.validate.outputs.steps }}
+          ACTION: ${{ steps.validate.outputs.action }}
+          ENVIRONMENT: ${{ steps.validate.outputs.environment }}
+          TARGET_SHA: ${{ steps.resolve_sha.outputs.resolved_sha || steps.validate.outputs.target_sha }}
+          ORIGINAL_REF: ${{ steps.resolve_sha.outputs.original_ref || steps.validate.outputs.target_sha }}
+          STEPS: ${{ steps.validate.outputs.steps }}
           CURRENT_SHA: ${{ steps.determine_current.outputs.current_sha }}
           API_TARGET_SHA: ${{ steps.compute_rollback_api.outputs.api_target_sha }}
           USED_API: ${{ steps.compute_rollback_api.outputs.used_api }}
@@ -825,13 +816,13 @@ jobs:
       - name: Verify Coverage Gate
         id: verify_coverage
         if: |
-          needs.validate.outputs.should_run == 'true' &&
-          (needs.validate.outputs.action == 'redeploy' || needs.validate.outputs.action == 'rollback') &&
+          steps.validate.outputs.should_run == 'true' &&
+          (steps.validate.outputs.action == 'redeploy' || steps.validate.outputs.action == 'rollback') &&
           steps.determine_sha.outputs.final_sha != ''
         uses: ./.github/actions/verify-coverage-gate
         with:
           target-sha: ${{ steps.determine_sha.outputs.final_sha }}
-          action-type: ${{ needs.validate.outputs.action }}
+          action-type: ${{ steps.validate.outputs.action }}
           original-ref: ${{ steps.resolve_sha.outputs.original_ref }}
           github-token: ${{ github.token }}
 
@@ -846,7 +837,7 @@ jobs:
             const errorMessage = ${{ toJSON(steps.verify_coverage.outputs.error_message) }};
             const opsIssueNumber = Number(process.env.OPS_ISSUE_NUMBER);
             const isWorkflowDispatch = context.eventName === 'workflow_dispatch';
-            const action = '${{ needs.validate.outputs.action }}';
+            const action = '${{ steps.validate.outputs.action }}';
             const targetSha = '${{ steps.verify_coverage.outputs.target_sha }}';
             const checkUrl = '${{ steps.verify_coverage.outputs.check_url }}';
             const coveragePct = '${{ steps.verify_coverage.outputs.coverage_pct }}' || 'N/A';
@@ -903,9 +894,9 @@ jobs:
       - name: Verify Staging Deployment (Production Redeploy Only)
         id: verify_staging
         if: |
-          needs.validate.outputs.should_run == 'true' &&
-          needs.validate.outputs.environment == 'production' &&
-          needs.validate.outputs.action == 'redeploy' &&
+          steps.validate.outputs.should_run == 'true' &&
+          steps.validate.outputs.environment == 'production' &&
+          steps.validate.outputs.action == 'redeploy' &&
           steps.determine_sha.outputs.final_sha != ''
         uses: actions/github-script@v7
         with:
@@ -1040,6 +1031,30 @@ jobs:
               issue_number: targetIssue,
               body: comment
             });
+
+
+  execute-ops:
+    needs: validate
+    if: needs.validate.outputs.should_run == 'true'
+    runs-on: self-hosted
+
+    # GitHub Environment protection (requires manual approval for production if configured)
+    # Dynamic environment selection based on validation output
+    # NOTE: This approval happens AFTER ALL validation checks pass (authorization, coverage, staging verification)
+    # This prevents wasting reviewer time on operations that will fail verification
+    environment:
+      name: ${{ needs.validate.outputs.environment }}
+      url: ${{ format('http://{0}/{1}', vars.VM_HOST, needs.validate.outputs.environment) }}
+
+    # Prevent runaway operations - fail if job exceeds 15 minutes
+    timeout-minutes: 15
+
+    steps:
+      # STEP 0: Checkout repository for composite actions
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       # STEP 7: Create GitHub Deployment record
       # Creates a deployment tied to the target SHA for tracking
