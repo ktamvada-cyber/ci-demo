@@ -1280,7 +1280,7 @@ jobs:
         if: needs.validate.outputs.should_run == 'true' && needs.validate.outputs.action == 'redeploy'
         uses: ./.github/actions/deploy-to-vm
         with:
-          commit-sha: ${{ steps.determine_sha.outputs.final_sha }}
+          commit-sha: ${{ needs.validate.outputs.final_sha }}
           environment: ${{ needs.validate.outputs.environment }}
           vm-host: ${{ vars.VM_HOST }}
           vm-user: ${{ vars.VM_USER }}
@@ -1298,7 +1298,7 @@ jobs:
         if: needs.validate.outputs.should_run == 'true' && needs.validate.outputs.action == 'rollback'
         uses: ./.github/actions/deploy-to-vm
         with:
-          commit-sha: ${{ steps.determine_sha.outputs.final_sha }}
+          commit-sha: ${{ needs.validate.outputs.final_sha }}
           environment: ${{ needs.validate.outputs.environment }}
           vm-host: ${{ vars.VM_HOST }}
           vm-user: ${{ vars.VM_USER }}
@@ -1327,11 +1327,11 @@ jobs:
             const action = '${{ needs.validate.outputs.action }}';
             const environment = '${{ needs.validate.outputs.environment }}';
             const requester = '${{ needs.validate.outputs.requester }}';
-            const finalSha = '${{ steps.determine_sha.outputs.final_sha }}';
+            const finalSha = '${{ needs.validate.outputs.final_sha }}';
             const targetSha = '${{ needs.validate.outputs.target_sha }}';
             const steps_back = '${{ needs.validate.outputs.steps }}';
-            const currentSha = '${{ steps.determine_current.outputs.current_sha }}';
-            const usedApi = '${{ steps.compute_rollback_api.outputs.used_api }}';
+            const currentSha = '${{ needs.validate.outputs.current_sha }}';
+            const usedApi = '${{ needs.validate.outputs.used_api }}';
             const jobStatus = '${{ job.status }}';
             const healthStatus = '${{ steps.execute_ops.outputs.health_status }}';
             const vmHost = process.env.VM_HOST;
@@ -1412,8 +1412,8 @@ jobs:
             const deploymentId = Number('${{ steps.create_deployment.outputs.deployment_id }}');
             const environment = '${{ needs.validate.outputs.environment }}';
             const action = '${{ needs.validate.outputs.action }}';
-            const finalSha = '${{ steps.determine_sha.outputs.final_sha }}';
-            const currentSha = '${{ steps.determine_current.outputs.current_sha }}';
+            const finalSha = '${{ needs.validate.outputs.final_sha }}';
+            const currentSha = '${{ needs.validate.outputs.current_sha }}';
             const jobStatus = '${{ job.status }}';
 
             // Reuse cached branch/PR info from Create Deployment step (avoids duplicate API calls)
