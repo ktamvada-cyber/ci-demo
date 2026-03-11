@@ -1066,10 +1066,10 @@ jobs:
           script: |
             const environment = '${{ needs.validate.outputs.environment }}';
             const action = '${{ needs.validate.outputs.action }}';
-            const finalSha = '${{ steps.determine_sha.outputs.final_sha }}';
-            const currentSha = '${{ steps.determine_current.outputs.current_sha }}';
+            const finalSha = '${{ needs.validate.outputs.final_sha }}';
+            const currentSha = '${{ needs.validate.outputs.current_sha }}';
             const requester = '${{ needs.validate.outputs.requester }}';
-            const currentImage = '${{ steps.determine_current.outputs.current_image }}';
+            const currentImage = '${{ needs.validate.outputs.current_image }}';
 
             // Always use SHA format (never branch name like "main")
             // Priority: finalSha (target) > currentSha (running) > context.sha (workflow trigger)
