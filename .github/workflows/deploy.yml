@@ -398,7 +398,7 @@ jobs:
             }
 
             core.info(`✅ Staging verification passed`);
-            core.info(`📍 Proceeding with production deployment of: ${targetSha}`)
+            core.info(`📍 Proceeding with production deployment of: ${targetSha}`);
 
       # STEP 1.9: Post staging verification failure message
       # Runs if staging verification check failed
