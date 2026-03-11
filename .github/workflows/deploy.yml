@@ -271,7 +271,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const errorMessage = '${{ steps.verify_coverage.outputs.error_message }}';
+            const errorMessage = ${{ toJSON(steps.verify_coverage.outputs.error_message) }};
             const targetSha = '${{ steps.verify_coverage.outputs.target_sha }}';
             const checkUrl = '${{ steps.verify_coverage.outputs.check_url }}';
             const coveragePct = '${{ steps.verify_coverage.outputs.coverage_pct }}' || 'N/A';
@@ -408,7 +408,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const errorMessage = '${{ steps.verify_staging.outputs.error_message }}';
+            const errorMessage = ${{ toJSON(steps.verify_staging.outputs.error_message) }};
             const targetSha = '${{ steps.validate.outputs.pr_sha }}';
 
             const comment = `### ❌ Production Deployment Blocked - Staging Verification Failed
