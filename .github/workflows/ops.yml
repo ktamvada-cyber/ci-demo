@@ -980,7 +980,7 @@ jobs:
             }
 
             core.info(`✅ Staging verification passed`);
-            core.info(`📍 Proceeding with production redeploy of: ${targetSha}`)
+            core.info(`📍 Proceeding with production redeploy of: ${targetSha}`);
 
       # STEP 5.8: Post staging verification failure message
       # Runs if staging verification check failed for production redeploy
