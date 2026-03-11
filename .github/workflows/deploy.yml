@@ -369,16 +369,23 @@ jobs:
                 per_page: 100
               });
 
-              // Sort by created_at descending to get most recent status first
-              const sortedStatuses = statuses.sort((a, b) =>
-                new Date(b.created_at) - new Date(a.created_at)
-              );
+              // Check if ANY status is 'success' (not just the most recent)
+              // A deployment may be marked 'inactive' later but still counts as successful
+              const successStatus = statuses.find(s => s.state === 'success');
 
-              if (sortedStatuses.length > 0 && sortedStatuses[0].state === 'success') {
+              if (successStatus) {
                 hasSuccessfulDeployment = true;
                 core.info(`✅ Found successful staging deployment: ID ${deployment.id}`);
-                core.info(`   Status: ${sortedStatuses[0].state}`);
-                core.info(`   Created: ${sortedStatuses[0].created_at}`);
+                core.info(`   Status: ${successStatus.state}`);
+                core.info(`   Created: ${successStatus.created_at}`);
+
+                // Also log if there's a more recent inactive status
+                const sortedStatuses = statuses.sort((a, b) =>
+                  new Date(b.created_at) - new Date(a.created_at)
+                );
+                if (sortedStatuses[0].state !== 'success') {
+                  core.info(`   Note: Current status is '${sortedStatuses[0].state}' but deployment was successful`);
+                }
                 break;
               }
             }
