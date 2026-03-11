@@ -39,21 +39,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validate-and-deploy:
+  # JOB 1: VALIDATION - Runs FIRST without environment protection
+  # Checks authorization, PR state, and coverage BEFORE asking for approval
+  # This prevents wasting reviewer time on deployments that will fail validation
+  validate:
     # Security: Only run on pull request comments (not regular issues)
     if: github.event.issue.pull_request != null
     runs-on: self-hosted
+    timeout-minutes: 5
 
-    # Environment-based deployment protection
-    # Production deployments require manual approval from designated reviewers
-    # Staging deployments proceed automatically after validation
-    environment:
-      name: ${{ github.event.comment.body == '[prod]' && 'production' || 'staging' }}
-      url: ${{ format('http://{0}/{1}', vars.VM_HOST, github.event.comment.body == '[prod]' && 'production' || 'staging') }}
-
-    # Prevent runaway deployments - fail if job exceeds 15 minutes
-    # Note: For production, this timeout includes time waiting for manual approval
-    timeout-minutes: 15
+    # Outputs for the deploy job
+    outputs:
+      should_deploy: ${{ steps.validate.outputs.should_deploy }}
+      environment: ${{ steps.validate.outputs.environment }}
+      pr_sha: ${{ steps.validate.outputs.pr_sha }}
+      pr_number: ${{ steps.validate.outputs.pr_number }}
+      pr_branch: ${{ steps.validate.outputs.pr_branch }}
 
     steps:
       # STEP 0: Checkout repository for composite actions
@@ -248,56 +249,6 @@ jobs:
               prNumber: context.issue.number
             };
 
-      # STEP 1.5: Create GitHub Deployment via API
-      # Creates a deployment record tied to the PR head SHA (not main)
-      # This gives correct visibility in GitHub Deployments/Environments UI
-      # The job-level environment: setting handles approval gates
-      - name: Create GitHub Deployment
-        id: create_deployment
-        if: steps.validate.outputs.should_deploy == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const environment = '${{ steps.validate.outputs.environment }}';
-            const prSha = '${{ steps.validate.outputs.pr_sha }}';
-            const prBranch = '${{ steps.validate.outputs.pr_branch }}';
-            const prNumber = '${{ steps.validate.outputs.pr_number }}';
-
-            core.info(`📝 Creating deployment record for ${environment}`);
-            core.info(`   Ref (SHA): ${prSha}`);
-            core.info(`   Branch: ${prBranch}`);
-            core.info(`   PR: #${prNumber}`);
-
-            const { data: deployment } = await github.rest.repos.createDeployment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: prSha,
-              task: `${prBranch}:deploy`,  // Shows branch + action in UI (e.g., "feature_1:deploy")
-              environment,
-              auto_merge: false,
-              description: `Deploy PR #${prNumber} (${prBranch}) to ${environment} via comment trigger`,
-              payload: {
-                pr_number: prNumber,
-                pr_branch: prBranch,
-                pr_sha: prSha,
-                triggered_by: context.payload.comment.user.login,
-                comment_id: context.payload.comment.id
-              }
-            });
-
-            core.setOutput('deployment_id', deployment.id);
-            core.info(`Deployment created: ID ${deployment.id}`);
-
-            // Mark as in-progress for better visibility
-            await github.rest.repos.createDeploymentStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              deployment_id: deployment.id,
-              state: 'in_progress',
-              environment,
-              description: `Deployment started for ${environment}`,
-              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
-            });
 
       # STEP 1.6: Verify Coverage Gate Passed
       # COVERAGE GATE: Block deployment if coverage check missing or failed
@@ -394,22 +345,96 @@ jobs:
               body: comment
             });
 
-      # STEP 3: Checkout exact commit SHA from PR HEAD
+  # JOB 2: DEPLOYMENT - Runs AFTER validation passes
+  # This job has environment protection (approval for production)
+  # Approval is only requested AFTER authorization checks pass
+  deploy:
+    needs: validate
+    if: needs.validate.outputs.should_deploy == 'true'
+    runs-on: self-hosted
+
+    # Environment-based deployment protection
+    # Production deployments require manual approval from designated reviewers
+    # Staging deployments proceed automatically after validation
+    # NOTE: This approval happens AFTER authorization checks in validate job
+    environment:
+      name: ${{ needs.validate.outputs.environment }}
+      url: ${{ format('http://{0}/{1}', vars.VM_HOST, needs.validate.outputs.environment) }}
+
+    # Prevent runaway deployments - fail if job exceeds 15 minutes
+    # Note: For production, this timeout includes time waiting for manual approval
+    timeout-minutes: 15
+
+    steps:
+      # STEP 0: Checkout repository for composite actions
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # STEP 1: Create GitHub Deployment via API
+      # Creates a deployment record tied to the PR head SHA (not main)
+      # This gives correct visibility in GitHub Deployments/Environments UI
+      - name: Create GitHub Deployment
+        id: create_deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const environment = '${{ needs.validate.outputs.environment }}';
+            const prSha = '${{ needs.validate.outputs.pr_sha }}';
+            const prBranch = '${{ needs.validate.outputs.pr_branch }}';
+            const prNumber = '${{ needs.validate.outputs.pr_number }}';
+
+            core.info(`📝 Creating deployment record for ${environment}`);
+            core.info(`   Ref (SHA): ${prSha}`);
+            core.info(`   Branch: ${prBranch}`);
+            core.info(`   PR: #${prNumber}`);
+
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: prSha,
+              task: `${prBranch}:deploy`,  // Shows branch + action in UI (e.g., "feature_1:deploy")
+              environment,
+              auto_merge: false,
+              description: `Deploy PR #${prNumber} (${prBranch}) to ${environment} via comment trigger`,
+              payload: {
+                pr_number: prNumber,
+                pr_branch: prBranch,
+                pr_sha: prSha,
+                triggered_by: context.payload.comment.user.login,
+                comment_id: context.payload.comment.id
+              }
+            });
+
+            core.setOutput('deployment_id', deployment.id);
+            core.info(`Deployment created: ID ${deployment.id}`);
+
+            // Mark as in-progress for better visibility
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.id,
+              state: 'in_progress',
+              environment,
+              description: `Deployment started for ${environment}`,
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+
+      # STEP 2: Checkout exact commit SHA from PR HEAD
       # SECURITY: Always checkout by exact SHA, NEVER by branch name
       # NEVER use git pull - always checkout specific commit
       # This ensures we deploy exactly what was validated, not what's currently on the branch
       - name: Checkout PR HEAD commit (exact SHA)
-        if: steps.validate.outputs.should_deploy == 'true'
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.validate.outputs.pr_sha }}
+          ref: ${{ needs.validate.outputs.pr_sha }}
           fetch-depth: 1
 
-      # STEP 4: Capture Build Metadata
+      # STEP 3: Capture Build Metadata
       # Record deployment metadata for tracking and observability
       - name: Capture Build Metadata
         id: build_metadata
-        if: steps.validate.outputs.should_deploy == 'true'
         run: |
           set -euo pipefail
 
@@ -423,13 +448,12 @@ jobs:
           echo "🆔 Deployment ID: ${{ github.run_id }}"
 
           # Full 40-character commit SHA (already provided by validation step)
-          echo "✅ Full Commit SHA: ${{ steps.validate.outputs.pr_sha }}"
+          echo "✅ Full Commit SHA: ${{ needs.validate.outputs.pr_sha }}"
 
-      # STEP 4.5: Setup SSH Key for VM Access
+      # STEP 4: Setup SSH Key for VM Access
       # Configure SSH authentication to connect to the VM
       # SECURITY: SSH private key stored as GitHub secret
       - name: Setup SSH Key for VM Access
-        if: steps.validate.outputs.should_deploy == 'true'
         uses: ./.github/actions/setup-ssh
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -441,10 +465,9 @@ jobs:
       # Prevents unnecessary downtime and service restarts
       - name: Check Already Deployed
         id: check_deployed
-        if: steps.validate.outputs.should_deploy == 'true'
         env:
-          COMMIT_SHA: ${{ steps.validate.outputs.pr_sha }}
-          ENVIRONMENT: ${{ steps.validate.outputs.environment }}
+          COMMIT_SHA: ${{ needs.validate.outputs.pr_sha }}
+          ENVIRONMENT: ${{ needs.validate.outputs.environment }}
         run: |
           set -euo pipefail
 
@@ -469,12 +492,13 @@ jobs:
       # STEP 6: Post redeployment notification (when same SHA is already deployed)
       # Informs user that same version will be redeployed with service restart
       - name: Post Redeployment Notice
-        if: steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed == 'true'
+        if: steps.check_deployed.outputs.already_deployed == 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const environment = '${{ steps.validate.outputs.environment }}';
-            const sha = '${{ steps.validate.outputs.pr_sha }}';
+            const environment = '${{ needs.validate.outputs.environment }}';
+            const sha = '${{ needs.validate.outputs.pr_sha }}';
+            const prNumber = '${{ needs.validate.outputs.pr_number }}';
             const buildTimestamp = '${{ steps.build_metadata.outputs.build_timestamp }}';
             const deploymentId = '${{ steps.build_metadata.outputs.deployment_id }}';
             const vmHost = process.env.VM_HOST;
@@ -506,7 +530,7 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: prNumber,
               body: comment
             });
 
@@ -516,10 +540,10 @@ jobs:
       # Using centralized deploy-to-vm composite action
       - name: Deploy to Staging
         id: deploy_staging
-        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'staging'
+        if: needs.validate.outputs.environment == 'staging'
         uses: ./.github/actions/deploy-to-vm
         with:
-          commit-sha: ${{ steps.validate.outputs.pr_sha }}
+          commit-sha: ${{ needs.validate.outputs.pr_sha }}
           environment: staging
           vm-host: ${{ vars.VM_HOST }}
           vm-user: ${{ vars.VM_USER }}
@@ -542,11 +566,11 @@ jobs:
       #
       # This step verifies that staging was deployed first, enforcing the staging-first workflow.
       - name: Verify Staging Deployment
-        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production' && steps.check_deployed.outputs.already_deployed != 'true'
+        if: needs.validate.outputs.environment == 'production' && steps.check_deployed.outputs.already_deployed != 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const targetSha = '${{ steps.validate.outputs.pr_sha }}';
+            const targetSha = '${{ needs.validate.outputs.pr_sha }}';
 
             core.info(`🔍 Verifying staging deployment for SHA: ${targetSha}`);
             core.info(`   Querying GitHub Deployments API for staging environment...`);
@@ -638,16 +662,17 @@ jobs:
           deployment-id: ${{ github.run_id }}
 
       # STEP 10: Post deployment status comment to PR
-      # Runs always (success or failure) if validation passed and deployment was attempted
+      # Runs always (success or failure) if deployment was attempted
       - name: Post Deployment Status
-        if: always() && steps.validate.outputs.should_deploy == 'true' && steps.check_deployed.outputs.already_deployed != 'true'
+        if: always() && steps.check_deployed.outputs.already_deployed != 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const environment = '${{ steps.validate.outputs.environment }}';
-            const sha = '${{ steps.validate.outputs.pr_sha }}';
+            const environment = '${{ needs.validate.outputs.environment }}';
+            const sha = '${{ needs.validate.outputs.pr_sha }}';
+            const prNumber = '${{ needs.validate.outputs.pr_number }}';
             const jobStatus = '${{ job.status }}';
-            const prBranch = '${{ steps.validate.outputs.pr_branch }}';
+            const prBranch = '${{ needs.validate.outputs.pr_branch }}';
             const buildTimestamp = '${{ steps.build_metadata.outputs.build_timestamp }}';
             const deploymentId = '${{ steps.build_metadata.outputs.deployment_id }}';
             const vmHost = process.env.VM_HOST;
@@ -702,12 +727,12 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: prNumber,
               body: comment
             });
 
       # STEP 11: Update GitHub Deployment Status
-      # Updates the deployment record created in step 1.5 with final status
+      # Updates the deployment record created in step 1 with final status
       # Runs always (success/failure/cancelled) if deployment was created
       - name: Update Deployment Status
         if: always() && steps.create_deployment.outputs.deployment_id
@@ -715,10 +740,10 @@ jobs:
         with:
           script: |
             const deploymentId = Number('${{ steps.create_deployment.outputs.deployment_id }}');
-            const environment = '${{ steps.validate.outputs.environment }}';
+            const environment = '${{ needs.validate.outputs.environment }}';
             const jobStatus = '${{ job.status }}';
             const alreadyDeployed = '${{ steps.check_deployed.outputs.already_deployed }}' === 'true';
-            const prSha = '${{ steps.validate.outputs.pr_sha }}';
+            const prSha = '${{ needs.validate.outputs.pr_sha }}';
 
             // Sanitizer to remove 4-byte Unicode characters (emoji) that GitHub API rejects
             const sanitize = (s) => Array.from(s)
