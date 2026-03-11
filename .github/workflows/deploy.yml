@@ -720,10 +720,10 @@ jobs:
       # Using centralized deploy-to-vm composite action
       - name: Deploy to Production
         id: deploy_production
-        if: steps.validate.outputs.should_deploy == 'true' && steps.validate.outputs.environment == 'production'
+        if: needs.validate.outputs.should_deploy == 'true' && needs.validate.outputs.environment == 'production'
         uses: ./.github/actions/deploy-to-vm
         with:
-          commit-sha: ${{ steps.validate.outputs.pr_sha }}
+          commit-sha: ${{ needs.validate.outputs.pr_sha }}
           environment: production
           vm-host: ${{ vars.VM_HOST }}
           vm-user: ${{ vars.VM_USER }}
