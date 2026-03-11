@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 app = FastAPI()
 
@@ -35,7 +35,7 @@ def deployment_info():
         "api_key": api_key_masked,
         "db_host": os.getenv("DB_HOST", "not-set"),
         "status": "running",
-        "server_time": datetime.utcnow().isoformat() + "Z"
+        "server_time": datetime.now(timezone.utc).isoformat() + "Z"
     }
 
 @app.get("/health")
@@ -62,4 +62,24 @@ def version_info():
         "deployment_id": os.getenv("DEPLOYMENT_ID", "unknown"),
         "build_timestamp": os.getenv("BUILD_TIMESTAMP", "unknown"),
         "feature": "GitHub Deployments API Integration Test"
+    }
+
+@app.get("/api/status")
+def deployment_status():
+    """
+    Comprehensive deployment status endpoint for testing and validation.
+    Returns all deployment metadata in a single call.
+    """
+    return {
+        "status": "operational",
+        "version": "2.11",
+        "environment": os.getenv("ENVIRONMENT", "unknown"),
+        "commit_sha": os.getenv("COMMIT_SHA", "unknown")[:7] if os.getenv("COMMIT_SHA") != "unknown" else "unknown",
+        "commit_sha_full": os.getenv("COMMIT_SHA", "unknown"),
+        "deployment_id": os.getenv("DEPLOYMENT_ID", "unknown"),
+        "db_host": os.getenv("DB_HOST", "not-set"),
+        "port": os.getenv("PORT", "8000"),
+        "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+        "test_mode": True,
+        "chatops_testing": "enabled"
     }
