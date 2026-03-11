@@ -50,18 +50,19 @@ on:
 env:
   # SECURITY: Only allow ops commands from this specific issue number (Ops Console)
   # Commands from any other issue will be rejected
-  # TODO: Create a pinned "Ops Console" issue and set the number here
-  OPS_ISSUE_NUMBER: 2
+  # See .github/PHASE1-SETUP.md for setup instructions
+  OPS_ISSUE_NUMBER: ${{ vars.OPS_ISSUE_NUMBER }}
 
-  # Deployment configuration constants
-  STAGING_PORT: 8001
-  PROD_PORT: 8002
-  STAGING_CONTAINER: myapp-staging
-  PROD_CONTAINER: myapp-prod
-  IMAGE_NAME: ci-demo
-  CONTAINER_INTERNAL_PORT: 8000
-  HEALTH_CHECK_MAX_RETRIES: 10
-  HEALTH_CHECK_RETRY_SLEEP: 2
+  # VM configuration sourced from repository variables for centralized management
+  # See .github/PHASE1-SETUP.md for setup instructions
+  VM_HOST: ${{ vars.VM_HOST }}
+  VM_USER: ${{ vars.VM_USER }}
+  VM_APP_PATH: ${{ vars.VM_APP_PATH }}
+  VM_SERVICE_NAME: ${{ vars.VM_SERVICE_NAME }}
+
+  # Authorization lists for ops operations (same as deploy.yml for consistency)
+  AUTHORIZED_STAGING_USERS: ${{ vars.AUTHORIZED_STAGING_USERS }}
+  AUTHORIZED_PRODUCTION_USERS: ${{ vars.AUTHORIZED_PRODUCTION_USERS }}
 
 # Explicit permissions following principle of least privilege
 # This workflow can only read code and write to issues/deployments - cannot push code or modify settings
@@ -74,26 +75,65 @@ permissions:
 
 # Concurrency control: Only ONE ops operation at a time across all environments
 # Cancel any in-progress ops action when a new one is triggered
-# Prevents race conditions and ensures clean container state
+# Prevents race conditions and ensures clean deployment state
 concurrency:
   group: ops
   cancel-in-progress: true
 
 jobs:
-  ops:
+  # JOB 1: VALIDATION - Runs FIRST without environment protection
+  # Validates ops trigger, performs authorization checks, and runs ALL verification steps
+  # This prevents wasting reviewer time on operations that will fail verification
+  #
+  # Checks performed (in order):
+  # 1. Command syntax validation
+  # 2. Authorization check (AUTHORIZED_STAGING_USERS / AUTHORIZED_PRODUCTION_USERS)
+  # 3. Ref/SHA resolution (convert tags/refs to commit SHAs)
+  # 4. Coverage gate verification (ensure target SHA has passing tests)
+  # 5. Staging-first verification (production redeploys require staging deployment)
+  #
+  # Only after ALL checks pass does the execute-ops job run (with environment protection)
+  validate:
+    # Security: Only run on non-PR issues (ops console) or manual workflow_dispatch
+    # This prevents ops workflow from triggering on PR comments (those should use deploy.yml)
+    # For issue comments, ONLY run on the designated Ops Console issue
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && github.event.issue.number == vars.OPS_ISSUE_NUMBER)
     runs-on: self-hosted
+    timeout-minutes: 10
 
-    # GitHub Environment protection (requires manual approval for production if configured)
-    # Dynamic environment selection based on validation step output
-    # Strict matching: [prod-restart], [prod-redeploy...], [prod-rollback...]
-    environment:
-      name: ${{ github.event.inputs.environment || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')) && 'production' || 'staging') }}
-      url: ${{ (github.event.inputs.environment == 'production' || (github.event_name == 'issue_comment' && (github.event.comment.body == '[prod-restart]' || startsWith(github.event.comment.body, '[prod-redeploy') || startsWith(github.event.comment.body, '[prod-rollback')))) && 'http://localhost:8002' || 'http://localhost:8001' }}
-
-    # Prevent runaway operations - fail if job exceeds 15 minutes
-    timeout-minutes: 15
+    # Outputs for the execute-ops job
+    outputs:
+      should_run: ${{ steps.validate.outputs.should_run }}
+      environment: ${{ steps.validate.outputs.environment }}
+      action: ${{ steps.validate.outputs.action }}
+      target_sha: ${{ steps.validate.outputs.target_sha }}
+      steps: ${{ steps.validate.outputs.steps }}
+      confirm: ${{ steps.validate.outputs.confirm }}
+      requester: ${{ steps.validate.outputs.requester }}
+      # Additional outputs from verification steps
+      resolved_sha: ${{ steps.resolve_sha.outputs.resolved_sha }}
+      final_sha: ${{ steps.determine_sha.outputs.final_sha }}
+      current_sha: ${{ steps.determine_current.outputs.current_sha }}
 
     steps:
+      # STEP 0: Checkout repository for composite actions
+      # GitHub Actions best practice: Check out repository at the start of the job
+      # This ensures all composite actions under .github/actions/ are available throughout the workflow
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # STEP 0.5: Setup SSH Key for VM Access
+      # Required for: restart operations and rollback-by-steps
+      # These operations need to query VM for current SHA during validation
+      - name: Setup SSH Key for VM Access
+        uses: ./.github/actions/setup-ssh
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          vm-host: ${{ env.VM_HOST }}
+          vm-user: ${{ env.VM_USER }}
+
       # STEP 1: Validate and parse ops trigger
       # Detects trigger source (workflow_dispatch vs issue_comment)
       # Parses and validates inputs strictly
@@ -234,15 +274,15 @@ jobs:
             }
 
             // SECURITY CHECK 2: Verify requester is authorized for the target environment
-            const stagingAuthorizedUsers = [
-              'ktamvada-cyber',  // repository owner
-              'gromag'           // additional staging operator
-            ];
+            // Different users can perform ops in different environments
+            // Authorization lists sourced from repository variables for centralized management
+            const stagingAuthorizedUsers = process.env.AUTHORIZED_STAGING_USERS
+              .split(',')
+              .map(u => u.trim());
 
-            const productionAuthorizedUsers = [
-              'ktamvada-cyber',  // repository owner
-              'gromag'           // production operator
-            ];
+            const productionAuthorizedUsers = process.env.AUTHORIZED_PRODUCTION_USERS
+              .split(',')
+              .map(u => u.trim());
 
             const authorizedUsers = environment === 'staging'
               ? stagingAuthorizedUsers
@@ -282,10 +322,6 @@ jobs:
               core.info(`✅ Rollback target validated`);
             }
 
-            // Determine container and port from workflow env constants
-            const containerName = environment === 'staging' ? process.env.STAGING_CONTAINER : process.env.PROD_CONTAINER;
-            const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
-
             // Set outputs
             core.setOutput('should_run', 'true');
             core.setOutput('action', action);
@@ -293,8 +329,6 @@ jobs:
             core.setOutput('target_sha', targetSha);
             core.setOutput('steps', steps);
             core.setOutput('confirm', confirm);
-            core.setOutput('container_name', containerName);
-            core.setOutput('port', port);
             core.setOutput('requester', requester);
             core.setOutput('skip_tagging', 'true');  // Ops workflow never tags
 
@@ -303,9 +337,7 @@ jobs:
             return {
               shouldRun: true,
               action,
-              environment,
-              containerName,
-              port
+              environment
             };
 
       # STEP 2: Post validation failure message
@@ -315,7 +347,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const errorMessage = '${{ steps.validate.outputs.error_message }}';
+            const errorMessage = ${{ toJSON(steps.validate.outputs.error_message) }};
             const opsIssueNumber = Number(process.env.OPS_ISSUE_NUMBER);
             const isWorkflowDispatch = context.eventName === 'workflow_dispatch';
 
@@ -340,15 +372,13 @@ jobs:
               body: comment
             });
 
-      # STEP 2.5: Resolve Ref/Tag to SHA
+      # STEP 3: Resolve Ref/Tag to SHA
       # If target_sha is provided, resolve it to a 40-char commit SHA
       # Accepts: 40-char SHA (pass-through), tags (v1.2.3), branches (main), or refs (refs/tags/v1.0.0)
       # This ensures the coverage gate always checks a real commit SHA
       - name: Resolve Ref to SHA
         id: resolve_sha
-        if: |
-          steps.validate.outputs.should_run == 'true' &&
-          steps.validate.outputs.target_sha != ''
+        if: steps.validate.outputs.target_sha != ''
         uses: actions/github-script@v7
         with:
           script: |
@@ -370,7 +400,6 @@ jobs:
 
             try {
               // Try to resolve as a ref (handles tags, branches, etc.)
-              // First try refs/tags/<input> (most common for version tags)
               let resolvedSha = '';
               let refType = '';
 
@@ -381,8 +410,6 @@ jobs:
                   ref: `tags/${inputRef}`
                 });
 
-                // For annotated tags, tagRef.object.sha is the tag object SHA
-                // We need to dereference to get the commit SHA
                 if (tagRef.object.type === 'tag') {
                   const { data: tagObject } = await github.rest.git.getTag({
                     owner: context.repo.owner,
@@ -398,7 +425,6 @@ jobs:
 
                 core.info(`✅ Resolved tag "${inputRef}" (${refType}) to commit SHA: ${resolvedSha}`);
               } catch (tagError) {
-                // Tag not found, try as a branch
                 try {
                   const { data: branchRef } = await github.rest.git.getRef({
                     owner: context.repo.owner,
@@ -409,7 +435,6 @@ jobs:
                   refType = 'branch';
                   core.info(`✅ Resolved branch "${inputRef}" to commit SHA: ${resolvedSha}`);
                 } catch (branchError) {
-                  // Not a tag or branch, try as a raw ref (e.g., refs/pull/123/head)
                   try {
                     const { data: rawRef } = await github.rest.git.getRef({
                       owner: context.repo.owner,
@@ -420,7 +445,6 @@ jobs:
                     refType = 'raw ref';
                     core.info(`✅ Resolved ref "${inputRef}" to commit SHA: ${resolvedSha}`);
                   } catch (refError) {
-                    // Last resort: try to get commit directly (handles short SHAs)
                     try {
                       const { data: commit } = await github.rest.repos.getCommit({
                         owner: context.repo.owner,
@@ -441,7 +465,6 @@ jobs:
                 }
               }
 
-              // Verify resolved SHA is a valid 40-char hex string
               if (!/^[a-f0-9]{40}$/.test(resolvedSha)) {
                 const errorMsg = `❌ REF RESOLUTION FAILED: Resolved SHA "${resolvedSha}" is not a valid 40-char hex string.`;
                 core.setOutput('error_message', errorMsg);
@@ -472,14 +495,13 @@ jobs:
               return { error: errorMsg };
             }
 
-      # STEP 2.6: Post ref resolution failure message
-      # Runs if ref resolution failed
+      # STEP 4: Post ref resolution failure message
       - name: Post Ref Resolution Failure
         if: always() && steps.resolve_sha.outcome == 'failure'
         uses: actions/github-script@v7
         with:
           script: |
-            const errorMessage = '${{ steps.resolve_sha.outputs.error_message }}';
+            const errorMessage = ${{ toJSON(steps.resolve_sha.outputs.error_message) }};
             const originalRef = '${{ steps.resolve_sha.outputs.original_ref }}';
             const opsIssueNumber = Number(process.env.OPS_ISSUE_NUMBER);
             const isWorkflowDispatch = context.eventName === 'workflow_dispatch';
@@ -509,8 +531,6 @@ jobs:
             📋 **View Ops Workflow:** [Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
             `;
 
-            // For workflow_dispatch, try to post to ops console
-            // For issue_comment, post to the same issue (which should be ops console)
             const targetIssue = isWorkflowDispatch ? opsIssueNumber : context.issue.number;
 
             await github.rest.issues.createComment({
@@ -520,38 +540,34 @@ jobs:
               body: comment
             });
 
-      # STEP 3: Determine current SHA from running container
-      # Extract current SHA and image reference for rollback calculations
+  # JOB 2: EXECUTE-OPS - Runs AFTER validation passes
+  # This job has environment protection (approval for production)
+  # Approval is only requested AFTER authorization checks pass
+      # STEP 3: Determine current SHA from VM deployment
+      # Query VM to get currently deployed commit SHA
       - name: Determine Current SHA
         id: determine_current
         if: steps.validate.outputs.should_run == 'true'
         env:
-          CONTAINER_NAME: ${{ steps.validate.outputs.container_name }}
+          ENVIRONMENT: ${{ steps.validate.outputs.environment }}
         run: |
-          echo "🔍 Determining current state..."
+          set -euo pipefail
 
-          CURRENT_SHA=""
-          CURRENT_IMAGE=""
+          echo "🔍 Determining current deployment state on VM..."
 
-          # Try to get current SHA from running container
-          if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            CURRENT_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME} 2>/dev/null || echo "")
-            echo "📦 Current image: ${CURRENT_IMAGE}"
+          # SSH into VM and get current SHA
+          CURRENT_SHA=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+            "git -C ${VM_APP_PATH} rev-parse HEAD 2>/dev/null || echo unknown" 2>/dev/null || echo "")
 
-            # Extract SHA from image tag (${IMAGE_NAME}:<sha>)
-            if [[ "$CURRENT_IMAGE" =~ ${IMAGE_NAME}:([a-f0-9]{40}) ]]; then
-              CURRENT_SHA="${BASH_REMATCH[1]}"
-              echo "📍 Current SHA: ${CURRENT_SHA}"
-            else
-              echo "⚠️  Could not extract SHA from current image tag"
-            fi
+          if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" != "unknown" ]; then
+            echo "📍 Current SHA: ${CURRENT_SHA}"
           else
-            echo "ℹ️  No container currently running"
+            echo "⚠️  Could not determine current SHA from VM"
+            CURRENT_SHA=""
           fi
 
           # Output results
           echo "current_sha=${CURRENT_SHA}" >> $GITHUB_OUTPUT
-          echo "current_image=${CURRENT_IMAGE}" >> $GITHUB_OUTPUT
 
       # STEP 4: Compute Rollback Target (GitHub Deployments API)
       # PRIMARY source of truth for rollback-by-steps
@@ -714,60 +730,51 @@ jobs:
             }
 
       # STEP 5: Determine target SHA for operation
-      # For restart: infer SHA from running container
-      # For redeploy: use resolved SHA (from tag/ref) or infer from running container
-      # For rollback: use resolved SHA (from tag/ref), API result, or local history fallback
+      # For restart: uses current deployment SHA
+      # For redeploy: use resolved SHA (from tag/ref)
+      # For rollback: use resolved SHA (from tag/ref) or GitHub Deployments API result
       - name: Determine Target SHA
         id: determine_sha
         if: steps.validate.outputs.should_run == 'true'
         env:
           ACTION: ${{ steps.validate.outputs.action }}
           ENVIRONMENT: ${{ steps.validate.outputs.environment }}
-          CONTAINER_NAME: ${{ steps.validate.outputs.container_name }}
           TARGET_SHA: ${{ steps.resolve_sha.outputs.resolved_sha || steps.validate.outputs.target_sha }}
           ORIGINAL_REF: ${{ steps.resolve_sha.outputs.original_ref || steps.validate.outputs.target_sha }}
           STEPS: ${{ steps.validate.outputs.steps }}
           CURRENT_SHA: ${{ steps.determine_current.outputs.current_sha }}
-          CURRENT_IMAGE: ${{ steps.determine_current.outputs.current_image }}
           API_TARGET_SHA: ${{ steps.compute_rollback_api.outputs.api_target_sha }}
           USED_API: ${{ steps.compute_rollback_api.outputs.used_api }}
         run: |
+          set -euo pipefail
+
           echo "🔍 Determining target SHA for ${ACTION}..."
 
           FINAL_SHA=""
-          FINAL_IMAGE_REF=""
 
           if [ "$ACTION" = "restart" ]; then
             # For restart, we use current SHA (if available) but don't require it
             FINAL_SHA="${CURRENT_SHA}"
-            FINAL_IMAGE_REF="${CURRENT_IMAGE}"
-            echo "♻️  Restart operation: using current SHA/image"
+            echo "♻️  Restart operation: using current SHA"
 
           elif [ "$ACTION" = "redeploy" ]; then
-            # For redeploy, use provided SHA or current SHA/image
+            # For redeploy, use provided SHA (required)
             if [ -n "$TARGET_SHA" ]; then
               FINAL_SHA="$TARGET_SHA"
-              FINAL_IMAGE_REF="${IMAGE_NAME}:${FINAL_SHA}"
               if [ -n "$ORIGINAL_REF" ] && [ "$ORIGINAL_REF" != "$TARGET_SHA" ]; then
                 echo "🎯 Redeploy with SHA from ${ORIGINAL_REF}: ${FINAL_SHA}"
               else
                 echo "🎯 Redeploy with provided SHA: ${FINAL_SHA}"
               fi
             else
-              # Use current container's image (allow redeploy from inferred image)
-              if [ -z "$CURRENT_IMAGE" ]; then
-                echo "❌ ERROR: Cannot redeploy without target SHA when no container is running"
-                echo "   Please provide sha=<sha|tag|ref> or ensure a container is currently running"
-                echo "   Examples: sha=abc123...def, sha=v1.2.3, sha=main"
-                exit 1
-              fi
-              FINAL_SHA="${CURRENT_SHA}"
-              FINAL_IMAGE_REF="${CURRENT_IMAGE}"
-              echo "🔄 Redeploy with current SHA/image: ${FINAL_SHA:-'(from image)'}"
+              echo "❌ ERROR: Cannot redeploy without target SHA"
+              echo "   Please provide sha=<sha|tag|ref>"
+              echo "   Examples: sha=abc123...def, sha=v1.2.3, sha=main"
+              exit 1
             fi
 
           elif [ "$ACTION" = "rollback" ]; then
-            # For rollback, prioritize: provided SHA (resolved from tag/ref) > API result > local history
+            # For rollback, prioritize: provided SHA (resolved from tag/ref) > GitHub Deployments API result
             if [ -n "$TARGET_SHA" ]; then
               FINAL_SHA="$TARGET_SHA"
               if [ -n "$ORIGINAL_REF" ] && [ "$ORIGINAL_REF" != "$TARGET_SHA" ]; then
@@ -777,124 +784,30 @@ jobs:
               fi
 
             elif [ "$USED_API" = "true" ] && [ -n "$API_TARGET_SHA" ]; then
-              # Use API result (PRIMARY source of truth)
+              # Use GitHub Deployments API result (PRIMARY source of truth)
               FINAL_SHA="$API_TARGET_SHA"
               echo "✅ Rollback target from GitHub Deployments API: ${FINAL_SHA}"
 
             else
-              # Fallback to local history file
-              echo "📚 Calculating rollback target from local history (${STEPS} step(s) back)..."
-
-              HISTORY_FILE="/tmp/myapp-${ENVIRONMENT}.history"
-
-              if [ -f "$HISTORY_FILE" ]; then
-                echo "📁 Using local history fallback: ${HISTORY_FILE}"
-
-                # Extract all SHAs from history (in chronological order, newest at bottom)
-                # Filter to only lines with ' sha=' to exclude restart-only entries
-                HISTORY_SHAS=$(grep -o ' sha=[a-f0-9]\{40\}' "$HISTORY_FILE" | cut -d= -f2)
-
-                if [ -z "$HISTORY_SHAS" ]; then
-                  echo "❌ ERROR: No SHA-based deployments in local history"
-                  exit 1
-                fi
-
-                # Count total SHA entries
-                SHA_COUNT=$(echo "$HISTORY_SHAS" | wc -l | tr -d ' ')
-                echo "ℹ️  Found ${SHA_COUNT} SHA-based deployments in local history"
-
-                HISTORY_SHA=""
-
-                if [ -n "$CURRENT_SHA" ]; then
-                  # Find current SHA position in reversed list (newest first, 1-indexed)
-                  CURRENT_INDEX=$(echo "$HISTORY_SHAS" | tac | grep -n "^${CURRENT_SHA}$" | tail -1 | cut -d: -f1 || echo "0")
-
-                  if [ "$CURRENT_INDEX" -gt 0 ]; then
-                    # Found current SHA. Target is STEPS further back
-                    # Array is newest-first: [current, previous, 2-back, ...]
-                    # steps=1 → previous (current+1), steps=2 → 2-back (current+2)
-                    TARGET_INDEX=$((CURRENT_INDEX + STEPS))
-
-                    # Bounds check
-                    if [ "$TARGET_INDEX" -le "$SHA_COUNT" ]; then
-                      # Extract SHA at target index (from reversed list)
-                      HISTORY_SHA=$(echo "$HISTORY_SHAS" | tac | sed -n "${TARGET_INDEX}p")
-                      echo "ℹ️  Current SHA at position ${CURRENT_INDEX}, target at position ${TARGET_INDEX}"
-                    else
-                      echo "❌ ERROR: Target position ${TARGET_INDEX} exceeds history (${SHA_COUNT} entries)"
-                      echo "   Cannot rollback ${STEPS} step(s) from current position ${CURRENT_INDEX}"
-                      exit 1
-                    fi
-                  else
-                    # Current SHA not in history - use newest deployment as baseline (index 1)
-                    # Then apply steps from that baseline: target = 1 + steps
-                    # steps=1 → index 2 (previous from baseline), steps=2 → index 3 (2-back from baseline)
-                    TARGET_INDEX=$((1 + STEPS))
-
-                    echo "ℹ️  Current SHA not in history; using newest deployment (index 1) as baseline"
-
-                    # Bounds check
-                    if [ "$TARGET_INDEX" -le "$SHA_COUNT" ]; then
-                      HISTORY_SHA=$(echo "$HISTORY_SHAS" | tac | sed -n "${TARGET_INDEX}p")
-                      echo "ℹ️  Baseline at position 1, target at position ${TARGET_INDEX}"
-                    else
-                      echo "❌ ERROR: Not enough SHA deployments in history to rollback ${STEPS} step(s)"
-                      echo "   Need at least $((STEPS + 1)) entries, found ${SHA_COUNT}"
-                      exit 1
-                    fi
-                  fi
-                else
-                  # No current SHA - use newest deployment as baseline (index 1)
-                  # Then apply steps from that baseline: target = 1 + steps
-                  # steps=1 → index 2 (previous from baseline), steps=2 → index 3 (2-back from baseline)
-                  TARGET_INDEX=$((1 + STEPS))
-
-                  echo "ℹ️  No current SHA; using newest deployment (index 1) as baseline"
-
-                  # Bounds check
-                  if [ "$TARGET_INDEX" -le "$SHA_COUNT" ]; then
-                    HISTORY_SHA=$(echo "$HISTORY_SHAS" | tac | sed -n "${TARGET_INDEX}p")
-                    echo "ℹ️  Baseline at position 1, target at position ${TARGET_INDEX}"
-                  else
-                    echo "❌ ERROR: Not enough SHA deployments in history to rollback ${STEPS} step(s)"
-                    echo "   Need at least $((STEPS + 1)) entries, found ${SHA_COUNT}"
-                    exit 1
-                  fi
-                fi
-
-                if [ -n "$HISTORY_SHA" ]; then
-                  FINAL_SHA="$HISTORY_SHA"
-                  echo "✅ Rollback target from local history: ${FINAL_SHA}"
-                else
-                  echo "❌ ERROR: Could not determine rollback target from local history"
-                  echo "   Current SHA: ${CURRENT_SHA}"
-                  echo "   Steps: ${STEPS}"
-                  echo "   SHA-based entries in history: ${SHA_COUNT}"
-                  exit 1
-                fi
-              else
-                echo "❌ ERROR: No deployment history available"
-                echo "   GitHub Deployments API: insufficient data"
-                echo "   Local history file not found: ${HISTORY_FILE}"
-                echo "   Cannot calculate rollback target for steps=${STEPS}"
-                exit 1
-              fi
+              # If GitHub Deployments API doesn't have enough data, fail
+              echo "❌ ERROR: No deployment history available"
+              echo "   GitHub Deployments API: insufficient data for rollback"
+              echo "   Cannot calculate rollback target for steps=${STEPS}"
+              echo "   Please use an explicit SHA instead of steps for rollback"
+              exit 1
             fi
-
-            FINAL_IMAGE_REF="${IMAGE_NAME}:${FINAL_SHA}"
           fi
 
-          # Validate final SHA or image
-          if [ -z "$FINAL_SHA" ] && [ -z "$FINAL_IMAGE_REF" ] && [ "$ACTION" != "restart" ]; then
-            echo "❌ ERROR: Could not determine target SHA or image for ${ACTION}"
+          # Validate final SHA (not required for restart)
+          if [ -z "$FINAL_SHA" ] && [ "$ACTION" != "restart" ]; then
+            echo "❌ ERROR: Could not determine target SHA for ${ACTION}"
             exit 1
           fi
 
           # Output results
           echo "final_sha=${FINAL_SHA}" >> $GITHUB_OUTPUT
-          echo "final_image_ref=${FINAL_IMAGE_REF}" >> $GITHUB_OUTPUT
 
-          echo "✅ Target determined: SHA=${FINAL_SHA:-'(from image)'} Image=${FINAL_IMAGE_REF:-'N/A'}"
+          echo "✅ Target determined: SHA=${FINAL_SHA:-'current'}"
 
       # STEP 5.5: Verify Coverage Gate Passed
       # COVERAGE GATE: Block redeploy/rollback if coverage check missing or failed
@@ -906,94 +819,12 @@ jobs:
           steps.validate.outputs.should_run == 'true' &&
           (steps.validate.outputs.action == 'redeploy' || steps.validate.outputs.action == 'rollback') &&
           steps.determine_sha.outputs.final_sha != ''
-        uses: actions/github-script@v7
+        uses: ./.github/actions/verify-coverage-gate
         with:
-          script: |
-            const targetSha = '${{ steps.determine_sha.outputs.final_sha }}';
-            const action = '${{ steps.validate.outputs.action }}';
-            const originalRef = '${{ steps.resolve_sha.outputs.original_ref }}';
-            const isResolved = originalRef && originalRef !== targetSha;
-            const requiredCheckName = 'test-coverage';  // Must match job name in test-coverage.yml
-
-            if (isResolved) {
-              core.info(`🔍 Checking coverage gate for ${action} to ${originalRef} → ${targetSha}`);
-            } else {
-              core.info(`🔍 Checking coverage gate for ${action} to SHA: ${targetSha}`);
-            }
-
-            // Query ALL check runs on this SHA (do not use check_name filter to avoid API quirks)
-            const { data: allChecks } = await github.rest.checks.listForRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: targetSha
-            });
-
-            core.info(`Found ${allChecks.total_count} total check runs for SHA ${targetSha.substring(0, 7)}`);
-
-            // Filter to find the coverage check by exact name match
-            const coverageChecks = allChecks.check_runs.filter(check => check.name === requiredCheckName);
-
-            core.info(`Found ${coverageChecks.length} check runs with name="${requiredCheckName}"`);
-
-            // Verify coverage check exists
-            if (coverageChecks.length === 0) {
-              const errorMsg = `❌ COVERAGE GATE FAILED: No "${requiredCheckName}" check found for SHA ${targetSha.substring(0, 7)}.\n\nCoverage tests must run before ${action}.`;
-              core.setOutput('error_message', errorMsg);
-              core.setOutput('target_sha', targetSha);
-              core.setFailed(errorMsg);
-              return { passed: false };
-            }
-
-            // Sort by completed_at (or started_at if not completed) descending to get most recent
-            const sortedChecks = coverageChecks.sort((a, b) => {
-              const timeA = new Date(a.completed_at || a.started_at || 0);
-              const timeB = new Date(b.completed_at || b.started_at || 0);
-              return timeB - timeA; // Newest first
-            });
-
-            // Get the most recent check run
-            const coverageCheck = sortedChecks[0];
-            core.info(`Using check run ID ${coverageCheck.id} (${coverageCheck.completed_at || coverageCheck.started_at})`);
-            core.info(`Check status: ${coverageCheck.status}, conclusion: ${coverageCheck.conclusion}`);
-
-            // Verify check is completed
-            if (coverageCheck.status !== 'completed') {
-              const statusMsg = coverageCheck.status === 'in_progress' ? 'still running' : coverageCheck.status;
-              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check is ${statusMsg}. Wait for coverage tests to complete.\n\nCheck: ${coverageCheck.html_url}`;
-              core.setOutput('error_message', errorMsg);
-              core.setOutput('target_sha', targetSha);
-              core.setOutput('check_url', coverageCheck.html_url);
-              core.setFailed(errorMsg);
-              return { passed: false };
-            }
-
-            // Verify check passed
-            if (coverageCheck.conclusion !== 'success') {
-              const errorMsg = `❌ COVERAGE GATE FAILED: Coverage check ${coverageCheck.conclusion}. Coverage must be ≥70% for ${action}.\n\nCheck: ${coverageCheck.html_url}`;
-              core.setOutput('error_message', errorMsg);
-              core.setOutput('target_sha', targetSha);
-              core.setOutput('check_url', coverageCheck.html_url);
-              core.setFailed(errorMsg);
-              return { passed: false };
-            }
-
-            // Extract coverage percentage from check run output (if available)
-            let coveragePct = 'N/A';
-            if (coverageCheck.output && coverageCheck.output.title) {
-              // Parse coverage from title like "✅ Coverage 74.0% (≥70%)"
-              const match = coverageCheck.output.title.match(/Coverage\s+([\d.]+)%/);
-              if (match) {
-                coveragePct = match[1];
-                core.info(`Extracted coverage: ${coveragePct}%`);
-              }
-            }
-
-            core.info(`✅ Coverage gate passed`);
-            core.setOutput('coverage_check_url', coverageCheck.html_url);
-            core.setOutput('coverage_pct', coveragePct);
-            core.setOutput('target_sha', targetSha);
-
-            return { passed: true, coveragePct };
+          target-sha: ${{ steps.determine_sha.outputs.final_sha }}
+          action-type: ${{ steps.validate.outputs.action }}
+          original-ref: ${{ steps.resolve_sha.outputs.original_ref }}
+          github-token: ${{ github.token }}
 
       # STEP 5.6: Post coverage gate failure message
       # Runs if coverage gate check failed for redeploy/rollback
@@ -1056,19 +887,188 @@ jobs:
               body: comment
             });
 
-      # STEP 6: Create GitHub Deployment record
-      # Creates a deployment tied to the target SHA for tracking
-      - name: Create GitHub Deployment
-        id: create_deployment
-        if: steps.validate.outputs.should_run == 'true'
+      # STEP 5.7: Verify Staging Deployment (Production Redeploy Pre-Check)
+      # PRODUCTION DEPLOYMENT POLICY:
+      # Production redeploys should only proceed after the same SHA has been tested in staging.
+      # This enforces the staging-first workflow for ops operations
+      - name: Verify Staging Deployment (Production Redeploy Only)
+        id: verify_staging
+        if: |
+          steps.validate.outputs.should_run == 'true' &&
+          steps.validate.outputs.environment == 'production' &&
+          steps.validate.outputs.action == 'redeploy' &&
+          steps.determine_sha.outputs.final_sha != ''
         uses: actions/github-script@v7
         with:
           script: |
-            const environment = '${{ steps.validate.outputs.environment }}';
-            const action = '${{ steps.validate.outputs.action }}';
+            const targetSha = '${{ steps.determine_sha.outputs.final_sha }}';
+
+            core.info(`🔍 Verifying staging deployment for SHA: ${targetSha}`);
+            core.info(`   Querying GitHub Deployments API for staging environment...`);
+
+            // Query all deployments for staging environment
+            const { data: deployments } = await github.rest.repos.listDeployments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              environment: 'staging',
+              sha: targetSha,
+              per_page: 100
+            });
+
+            core.info(`   Found ${deployments.length} staging deployment(s) for SHA ${targetSha.substring(0, 7)}`);
+
+            if (deployments.length === 0) {
+              const errorMsg = `❌ STAGING VERIFICATION FAILED: No staging deployment found for SHA ${targetSha.substring(0, 7)}\n\n` +
+                `**Production Deployment Policy:**\n` +
+                `This SHA must be deployed to staging first before production redeploy.\n\n` +
+                `**Required Action:**\n` +
+                `1. Deploy this SHA to staging first (via PR or ops command)\n` +
+                `2. Verify staging deployment is successful\n` +
+                `3. Then redeploy to production\n\n` +
+                `This ensures what is tested in staging is what gets deployed to production.`;
+              core.setOutput('error_message', errorMsg);
+              core.setFailed(errorMsg);
+              return;
+            }
+
+            // Get deployment statuses for each deployment and check for success
+            let hasSuccessfulDeployment = false;
+
+            for (const deployment of deployments) {
+              const { data: statuses } = await github.rest.repos.listDeploymentStatuses({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: deployment.id,
+                per_page: 100
+              });
+
+              // Sort by created_at descending to get most recent status first
+              const sortedStatuses = statuses.sort((a, b) =>
+                new Date(b.created_at) - new Date(a.created_at)
+              );
+
+              if (sortedStatuses.length > 0 && sortedStatuses[0].state === 'success') {
+                hasSuccessfulDeployment = true;
+                core.info(`✅ Found successful staging deployment: ID ${deployment.id}`);
+                core.info(`   Status: ${sortedStatuses[0].state}`);
+                core.info(`   Created: ${sortedStatuses[0].created_at}`);
+                break;
+              }
+            }
+
+            if (!hasSuccessfulDeployment) {
+              const errorMsg = `❌ STAGING VERIFICATION FAILED: SHA ${targetSha.substring(0, 7)} found in staging but no successful deployment\n\n` +
+                `**Status:** Staging deployment exists but did not complete successfully\n\n` +
+                `**Required Action:**\n` +
+                `1. Check staging deployment logs for errors\n` +
+                `2. Fix any issues and redeploy to staging\n` +
+                `3. Verify staging deployment completes successfully\n` +
+                `4. Then retry production redeploy\n\n` +
+                `Production redeploys require a successful staging deployment first.`;
+              core.setOutput('error_message', errorMsg);
+              core.setFailed(errorMsg);
+              return;
+            }
+
+            core.info(`✅ Staging verification passed`);
+            core.info(`📍 Proceeding with production redeploy of: ${targetSha}`);
+
+      # STEP 5.8: Post staging verification failure message
+      # Runs if staging verification check failed for production redeploy
+      # Provides immediate feedback to Ops Console
+      - name: Post Staging Verification Failure (Ops)
+        if: always() && steps.verify_staging.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errorMessage = ${{ toJSON(steps.verify_staging.outputs.error_message) }};
+            const targetSha = '${{ steps.determine_sha.outputs.final_sha }}';
+            const isWorkflowDispatch = context.eventName === 'workflow_dispatch';
+            const opsIssueNumber = Number(process.env.OPS_ISSUE_NUMBER);
+
+            const comment = `### ❌ Production Redeploy Blocked - Staging Verification Failed
+
+            **Error Details:**
+
+            ${errorMessage || '❌ Staging verification failed - see workflow logs'}
+
+            ---
+
+            #### 🚦 Staging-First Policy
+
+            **Why this policy exists:**
+            - Ensures consistency: What is tested in staging is what gets deployed to production
+            - Prevents untested code from reaching production
+            - Provides a safety net for catching issues before production
+
+            #### 🔧 How to Fix
+
+            1. Deploy this SHA to staging first:
+               \`\`\`
+               [staging-redeploy sha=${targetSha.substring(0, 7)}]
+               \`\`\`
+
+            2. Verify staging deployment succeeds and test your changes
+
+            3. Once staging is verified, redeploy to production:
+               \`\`\`
+               [prod-redeploy sha=${targetSha.substring(0, 7)} confirm=yes]
+               \`\`\`
+
+            **Target SHA:** \`${targetSha}\`
+
+            ---
+            📋 **View Ops Workflow:** [Run #${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `;
+
+            // For workflow_dispatch, post to ops console
+            // For issue_comment, post to the same issue (which should be ops console)
+            const targetIssue = isWorkflowDispatch ? opsIssueNumber : context.issue.number;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: targetIssue,
+              body: comment
+            });
+
+
+  execute-ops:
+    needs: validate
+    if: needs.validate.outputs.should_run == 'true'
+    runs-on: self-hosted
+
+    # GitHub Environment protection (requires manual approval for production if configured)
+    # Dynamic environment selection based on validation output
+    # NOTE: This approval happens AFTER ALL validation checks pass (authorization, coverage, staging verification)
+    # This prevents wasting reviewer time on operations that will fail verification
+    environment:
+      name: ${{ needs.validate.outputs.environment }}
+      url: ${{ format('http://{0}/{1}', vars.VM_HOST, needs.validate.outputs.environment) }}
+
+    # Prevent runaway operations - fail if job exceeds 15 minutes
+    timeout-minutes: 15
+
+    steps:
+      # STEP 0: Checkout repository for composite actions
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # STEP 7: Create GitHub Deployment record
+      # Creates a deployment tied to the target SHA for tracking
+      - name: Create GitHub Deployment
+        id: create_deployment
+        if: needs.validate.outputs.should_run == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const environment = '${{ needs.validate.outputs.environment }}';
+            const action = '${{ needs.validate.outputs.action }}';
             const finalSha = '${{ steps.determine_sha.outputs.final_sha }}';
             const currentSha = '${{ steps.determine_current.outputs.current_sha }}';
-            const requester = '${{ steps.validate.outputs.requester }}';
+            const requester = '${{ needs.validate.outputs.requester }}';
             const currentImage = '${{ steps.determine_current.outputs.current_image }}';
 
             // Always use SHA format (never branch name like "main")
@@ -1089,9 +1089,21 @@ jobs:
               });
 
               if (prs.length > 0) {
-                prNumber = prs[0].number;
-                branchName = prs[0].head.ref;
-                core.info(`   SHA ${shortSha} from PR #${prNumber} (${branchName})`);
+                // When multiple PRs share the same SHA, prefer:
+                // 1. Open PRs over closed/merged
+                // 2. Most recently updated PR
+                const sortedPrs = prs.sort((a, b) => {
+                  // Prefer open PRs
+                  if (a.state === 'open' && b.state !== 'open') return -1;
+                  if (a.state !== 'open' && b.state === 'open') return 1;
+                  // Then prefer most recently updated
+                  return new Date(b.updated_at) - new Date(a.updated_at);
+                });
+
+                const selectedPr = sortedPrs[0];
+                prNumber = selectedPr.number;
+                branchName = selectedPr.head.ref;
+                core.info(`   SHA ${shortSha} from PR #${prNumber} (${branchName})${prs.length > 1 ? ` [selected from ${prs.length} PRs]` : ''}`);
               } else {
                 // Strategy 2: Check if SHA is HEAD of any branch
                 const { data: branches } = await github.rest.repos.listBranchesForHeadCommit({
@@ -1180,268 +1192,150 @@ jobs:
               log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             });
 
-      # STEP 7: Execute ops operation
-      # Performs restart, redeploy, or rollback based on action
-      - name: Execute Ops Operation
-        id: execute_ops
-        if: steps.validate.outputs.should_run == 'true'
+      # STEP 6.5: Setup SSH Key for VM Access
+      # Configure SSH authentication to connect to the VM
+      # SECURITY: SSH private key stored as GitHub secret
+      - name: Setup SSH Key for VM Access
+        if: needs.validate.outputs.should_run == 'true'
+        uses: ./.github/actions/setup-ssh
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          vm-host: ${{ env.VM_HOST }}
+          vm-user: ${{ env.VM_USER }}
+
+      # STEP 7a: Execute Restart Operation
+      # Restarts the service with current code (no git checkout)
+      - name: Execute Restart Operation
+        id: execute_restart
+        if: needs.validate.outputs.should_run == 'true' && needs.validate.outputs.action == 'restart'
         env:
-          ACTION: ${{ steps.validate.outputs.action }}
-          ENVIRONMENT: ${{ steps.validate.outputs.environment }}
-          CONTAINER_NAME: ${{ steps.validate.outputs.container_name }}
-          PORT: ${{ steps.validate.outputs.port }}
-          FINAL_SHA: ${{ steps.determine_sha.outputs.final_sha }}
-          FINAL_IMAGE_REF: ${{ steps.determine_sha.outputs.final_image_ref }}
+          ENVIRONMENT: ${{ needs.validate.outputs.environment }}
           API_KEY: ${{ secrets.API_KEY }}
           DB_HOST: ${{ secrets.DB_HOST }}
         run: |
-          echo "🚀 Executing ops operation: ${ACTION} on ${ENVIRONMENT}"
-          echo "📦 Container: ${CONTAINER_NAME}"
-          echo "🔌 Port: ${PORT}"
+          set -euo pipefail
 
-          HEALTH_STATUS="unknown"
-          IMAGE_DIGEST=""
-          ACTUAL_IMAGE=""
+          echo "♻️  Performing restart operation..."
+          echo "VM Host: ${VM_HOST}"
+          echo "App Path: ${VM_APP_PATH}"
 
-          # ============================================================
-          # RESTART OPERATION
-          # ============================================================
-          if [ "$ACTION" = "restart" ]; then
-            echo "♻️  Performing restart operation..."
+          # SSH into VM and restart service
+          # Pass environment variables explicitly to avoid variable expansion issues
+          cat <<'SCRIPT_EOF' | ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} \
+            VM_SERVICE_NAME="${VM_SERVICE_NAME}" \
+            VM_APP_PATH="${VM_APP_PATH}" \
+            ENVIRONMENT="${ENVIRONMENT}" \
+            DEPLOYMENT_ID="${{ github.run_id }}" \
+            API_KEY="${API_KEY}" \
+            DB_HOST="${DB_HOST}" \
+            APP_PORT="${{ vars.APP_PORT }}" \
+            bash -s
+          set -euo pipefail
 
-            # Check if container exists
-            if ! docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "❌ ERROR: Container ${CONTAINER_NAME} does not exist"
-              exit 1
-            fi
+          echo "📝 Writing environment variables..."
+          cat > "$VM_APP_PATH/.env" <<ENV_EOF
+          ENVIRONMENT=$ENVIRONMENT
+          DEPLOYMENT_ID=$DEPLOYMENT_ID
+          API_KEY=$API_KEY
+          DB_HOST=$DB_HOST
+          PORT=$APP_PORT
+          COMMIT_SHA=$(cd "$VM_APP_PATH" && git rev-parse HEAD 2>/dev/null || echo "unknown")
+          ENV_EOF
 
-            # Restart container
-            echo "🔄 Restarting container: ${CONTAINER_NAME}"
-            docker restart ${CONTAINER_NAME}
+          echo "🔄 Restarting service..."
+          sudo systemctl restart "$VM_SERVICE_NAME"
 
-            # Wait for startup
-            echo "⏳ Waiting for service to start..."
-            sleep 5
+          echo "⏳ Waiting for service to initialize..."
+          sleep 3
 
-            # Get actual image and digest
-            ACTUAL_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME} 2>/dev/null || echo "")
-            IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${CONTAINER_NAME} 2>/dev/null || echo "")
-            if [ -z "$IMAGE_DIGEST" ]; then
-              IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${CONTAINER_NAME})
-            fi
-
-          # ============================================================
-          # REDEPLOY OPERATION
-          # ============================================================
-          elif [ "$ACTION" = "redeploy" ]; then
-            echo "🔄 Performing redeploy operation..."
-
-            # Determine image to redeploy
-            if [ -n "$FINAL_IMAGE_REF" ]; then
-              TARGET_IMAGE="$FINAL_IMAGE_REF"
-            elif [ -n "$FINAL_SHA" ]; then
-              TARGET_IMAGE="${IMAGE_NAME}:${FINAL_SHA}"
-            else
-              echo "❌ ERROR: Cannot redeploy without target image or SHA"
-              exit 1
-            fi
-
-            echo "🎯 Target image: ${TARGET_IMAGE}"
-
-            # Verify image exists
-            if ! docker image inspect ${TARGET_IMAGE} >/dev/null 2>&1; then
-              echo "❌ ERROR: Image does not exist: ${TARGET_IMAGE}"
-              echo ""
-              echo "Demo limitation: Image must be built locally first."
-              if [ -n "$FINAL_SHA" ]; then
-                echo "To build this image, deploy SHA ${FINAL_SHA} to staging first:"
-                echo "  Comment: [staging] on the PR for this SHA"
-              fi
-              exit 1
-            fi
-
-            # Stop and remove existing container
-            if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "🛑 Stopping existing container: ${CONTAINER_NAME}"
-              docker stop ${CONTAINER_NAME} 2>/dev/null || true
-              echo "🗑️  Removing existing container: ${CONTAINER_NAME}"
-              docker rm ${CONTAINER_NAME} 2>/dev/null || true
-            fi
-
-            # Get image digest before deployment
-            IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${TARGET_IMAGE} 2>/dev/null || echo "")
-            if [ -z "$IMAGE_DIGEST" ]; then
-              IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${TARGET_IMAGE})
-            fi
-            echo "🔐 Image Digest: ${IMAGE_DIGEST}"
-
-            # Run new container with runtime env injection
-            echo "▶️  Running new container: ${CONTAINER_NAME}"
-            docker run -d \
-              --name ${CONTAINER_NAME} \
-              -p ${PORT}:8000 \
-              -e ENVIRONMENT=${ENVIRONMENT} \
-              -e DEPLOYMENT_ID="${{ github.run_id }}" \
-              -e CONTAINER_NAME=${CONTAINER_NAME} \
-              -e PORT=${PORT} \
-              -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
-              -e API_KEY="${API_KEY}" \
-              -e DB_HOST="${DB_HOST}" \
-              ${TARGET_IMAGE}
-
-            ACTUAL_IMAGE="${TARGET_IMAGE}"
-
-            # Wait for startup
-            echo "⏳ Waiting for service to start..."
-            sleep 5
-
-          # ============================================================
-          # ROLLBACK OPERATION
-          # ============================================================
-          elif [ "$ACTION" = "rollback" ]; then
-            echo "⏪ Performing rollback operation..."
-
-            if [ -z "$FINAL_SHA" ]; then
-              echo "❌ ERROR: Cannot rollback without target SHA"
-              exit 1
-            fi
-
-            TARGET_IMAGE="${IMAGE_NAME}:${FINAL_SHA}"
-            echo "🎯 Rollback target: ${TARGET_IMAGE}"
-
-            # Verify image exists locally
-            if ! docker image inspect ${TARGET_IMAGE} >/dev/null 2>&1; then
-              echo "❌ ERROR: Rollback image does not exist locally: ${TARGET_IMAGE}"
-              echo ""
-              echo "Demo limitation: Image must be built locally first."
-              echo "To build this image, deploy SHA ${FINAL_SHA} to staging first:"
-              echo "  Comment: [staging] on the PR for this SHA"
-              echo ""
-              echo "Note: For production rollback, staging image gating is not required,"
-              echo "but the image must exist locally on the runner."
-              exit 1
-            fi
-            echo "✅ Rollback image verified: ${TARGET_IMAGE}"
-
-            # Stop and remove existing container
-            if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "🛑 Stopping existing container: ${CONTAINER_NAME}"
-              docker stop ${CONTAINER_NAME} 2>/dev/null || true
-              echo "🗑️  Removing existing container: ${CONTAINER_NAME}"
-              docker rm ${CONTAINER_NAME} 2>/dev/null || true
-            fi
-
-            # Get image digest before deployment
-            IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${TARGET_IMAGE} 2>/dev/null || echo "")
-            if [ -z "$IMAGE_DIGEST" ]; then
-              IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' ${TARGET_IMAGE})
-            fi
-            echo "🔐 Image Digest: ${IMAGE_DIGEST}"
-
-            # Run rollback container with runtime env injection
-            echo "▶️  Running rollback container: ${CONTAINER_NAME}"
-            docker run -d \
-              --name ${CONTAINER_NAME} \
-              -p ${PORT}:8000 \
-              -e ENVIRONMENT=${ENVIRONMENT} \
-              -e DEPLOYMENT_ID="${{ github.run_id }}" \
-              -e CONTAINER_NAME=${CONTAINER_NAME} \
-              -e PORT=${PORT} \
-              -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
-              -e API_KEY="${API_KEY}" \
-              -e DB_HOST="${DB_HOST}" \
-              ${TARGET_IMAGE}
-
-            ACTUAL_IMAGE="${TARGET_IMAGE}"
-
-            # Wait for startup
-            echo "⏳ Waiting for service to start..."
-            sleep 5
-          fi
-
-          # ============================================================
-          # HEALTH CHECK (common for all operations)
-          # ============================================================
-          echo "🏥 Checking service health..."
-
-          # Verify container is running
-          if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "❌ Container failed to start or restart"
-            docker logs ${CONTAINER_NAME} 2>/dev/null || true
-            HEALTH_STATUS="failed"
-            echo "health_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-
-          # Verify HTTP endpoint is responding (same retry logic as deploy.yml)
-          MAX_RETRIES=${HEALTH_CHECK_MAX_RETRIES}
+          echo "🏥 Checking health endpoint..."
+          MAX_RETRIES=10
+          RETRY_DELAY=2
           RETRY_COUNT=0
 
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            if curl -f -s -o /dev/null http://localhost:${PORT}/ 2>/dev/null; then
-              HEALTH_STATUS="healthy"
-              echo "✅ Service is healthy and responding"
+            if curl -f -s http://localhost:$APP_PORT/ >/dev/null 2>&1; then
+              echo "✅ Health check passed"
               break
             fi
             RETRY_COUNT=$((RETRY_COUNT + 1))
-            echo "⏳ Attempt $RETRY_COUNT/$MAX_RETRIES - waiting for service..."
-            sleep ${HEALTH_CHECK_RETRY_SLEEP}
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "⏳ Health check attempt $RETRY_COUNT/$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
+              sleep $RETRY_DELAY
+            else
+              echo "❌ Health check failed after $MAX_RETRIES attempts"
+              exit 1
+            fi
           done
 
-          if [ "$HEALTH_STATUS" != "healthy" ]; then
-            echo "⚠️  Warning: Service health check did not pass within timeout"
-            echo "   Container is running but may not be fully ready"
-            HEALTH_STATUS="running_unverified"
-          fi
+          echo "✅ Restart complete!"
+          SCRIPT_EOF
 
-          # ============================================================
-          # RECORD TO LOCAL HISTORY (only on successful operations)
-          # ============================================================
-          # Note: We only reach this point if:
-          #   1. Container is running (verified above)
-          #   2. Health check passed or timed out with "running_unverified"
-          # If container failed to start, we would have exited above with exit 1
-          HISTORY_FILE="/tmp/myapp-${ENVIRONMENT}.history"
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "✅ Restart operation completed successfully"
 
-          # Record all ops actions to history (restart, redeploy, rollback)
-          if [ -n "$FINAL_SHA" ]; then
-            echo "📝 Recording to local history: ${HISTORY_FILE}"
-            echo "${TIMESTAMP} action=${ACTION} sha=${FINAL_SHA} image=${ACTUAL_IMAGE:-${IMAGE_NAME}:${FINAL_SHA}} digest=${IMAGE_DIGEST} run_id=${{ github.run_id }}" >> ${HISTORY_FILE}
-          elif [ "$ACTION" = "restart" ] && [ -n "$ACTUAL_IMAGE" ]; then
-            # Record restart with image info (helpful for tracking)
-            echo "📝 Recording restart to local history: ${HISTORY_FILE}"
-            echo "${TIMESTAMP} action=${ACTION} image=${ACTUAL_IMAGE} digest=${IMAGE_DIGEST} run_id=${{ github.run_id }}" >> ${HISTORY_FILE}
-          fi
+      # STEP 7b: Execute Redeploy Operation
+      # Redeploys a specific commit SHA using centralized deploy-to-vm action
+      - name: Execute Redeploy Operation
+        id: execute_redeploy
+        if: needs.validate.outputs.should_run == 'true' && needs.validate.outputs.action == 'redeploy'
+        uses: ./.github/actions/deploy-to-vm
+        with:
+          commit-sha: ${{ steps.determine_sha.outputs.final_sha }}
+          environment: ${{ needs.validate.outputs.environment }}
+          vm-host: ${{ vars.VM_HOST }}
+          vm-user: ${{ vars.VM_USER }}
+          vm-app-path: ${{ vars.VM_APP_PATH }}
+          vm-service-name: ${{ vars.VM_SERVICE_NAME }}
+          app-port: ${{ vars.APP_PORT }}
+          api-key: ${{ secrets.API_KEY }}
+          db-host: ${{ secrets.DB_HOST }}
+          deployment-id: ${{ github.run_id }}
 
-          # Set outputs
-          echo "health_status=${HEALTH_STATUS}" >> $GITHUB_OUTPUT
-          echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
+      # STEP 7c: Execute Rollback Operation
+      # Rolls back to a previous commit SHA using centralized deploy-to-vm action
+      - name: Execute Rollback Operation
+        id: execute_rollback
+        if: needs.validate.outputs.should_run == 'true' && needs.validate.outputs.action == 'rollback'
+        uses: ./.github/actions/deploy-to-vm
+        with:
+          commit-sha: ${{ steps.determine_sha.outputs.final_sha }}
+          environment: ${{ needs.validate.outputs.environment }}
+          vm-host: ${{ vars.VM_HOST }}
+          vm-user: ${{ vars.VM_USER }}
+          vm-app-path: ${{ vars.VM_APP_PATH }}
+          vm-service-name: ${{ vars.VM_SERVICE_NAME }}
+          app-port: ${{ vars.APP_PORT }}
+          api-key: ${{ secrets.API_KEY }}
+          db-host: ${{ secrets.DB_HOST }}
+          deployment-id: ${{ github.run_id }}
 
+      # Set unified output for downstream steps
+      - name: Set Operation Status
+        id: execute_ops
+        if: always() && needs.validate.outputs.should_run == 'true'
+        run: |
+          echo "health_status=deployed" >> $GITHUB_OUTPUT
           echo "✅ Ops operation completed successfully"
-          echo "🏥 Health: ${HEALTH_STATUS}"
-          echo "🔐 Digest: ${IMAGE_DIGEST}"
 
       # STEP 8: Post ops status comment
       # Posts result to Ops Console issue
       - name: Post Ops Status Comment
-        if: always() && steps.validate.outputs.should_run == 'true'
+        if: always() && needs.validate.outputs.should_run == 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const action = '${{ steps.validate.outputs.action }}';
-            const environment = '${{ steps.validate.outputs.environment }}';
-            const containerName = '${{ steps.validate.outputs.container_name }}';
-            const port = '${{ steps.validate.outputs.port }}';
-            const requester = '${{ steps.validate.outputs.requester }}';
+            const action = '${{ needs.validate.outputs.action }}';
+            const environment = '${{ needs.validate.outputs.environment }}';
+            const requester = '${{ needs.validate.outputs.requester }}';
             const finalSha = '${{ steps.determine_sha.outputs.final_sha }}';
-            const targetSha = '${{ steps.validate.outputs.target_sha }}';
-            const steps_back = '${{ steps.validate.outputs.steps }}';
+            const targetSha = '${{ needs.validate.outputs.target_sha }}';
+            const steps_back = '${{ needs.validate.outputs.steps }}';
             const currentSha = '${{ steps.determine_current.outputs.current_sha }}';
             const usedApi = '${{ steps.compute_rollback_api.outputs.used_api }}';
             const jobStatus = '${{ job.status }}';
             const healthStatus = '${{ steps.execute_ops.outputs.health_status }}';
-            const imageDigest = '${{ steps.execute_ops.outputs.image_digest }}';
+            const vmHost = process.env.VM_HOST;
+            const vmAppPath = process.env.VM_APP_PATH;
 
             const statusEmoji = jobStatus === 'success' ? '✅' : '❌';
             const statusText = jobStatus === 'success' ? 'SUCCEEDED' : 'FAILED';
@@ -1456,17 +1350,16 @@ jobs:
               if (targetSha) {
                 targetDesc = `SHA: \`${targetSha}\``;
               } else {
-                const source = usedApi === 'true' ? 'GitHub Deployments API' : 'Local history fallback';
+                const source = usedApi === 'true' ? 'GitHub Deployments API' : 'Deployment history';
                 targetDesc = `${steps_back} step(s) back from \`${currentSha?.substring(0, 7) || 'current'}\` (via ${source})`;
               }
             }
 
             // Map health status to display text
             const healthMap = {
-              'healthy': '✅ Healthy (verified)',
-              'running_unverified': '⚠️ Running (unverified)',
+              'deployed': '✅ Deployed',
               'failed': '❌ Failed',
-              '': jobStatus === 'success' ? '✅ Running' : '❌ Failed'
+              '': jobStatus === 'success' ? '✅ Deployed' : '❌ Failed'
             };
             const healthDisplay = healthMap[healthStatus] || healthStatus;
 
@@ -1481,15 +1374,14 @@ jobs:
             | **Requested By** | @${requester} |
             | **Target** | ${targetDesc} |
             | **Result SHA** | \`${finalSha || 'N/A'}\` |
-            | **Container** | \`${containerName}\` |
-            | **Port** | \`${port}\` |
-            ${imageDigest ? `| **Image Digest** | \`${imageDigest.substring(0, 80)}${imageDigest.length > 80 ? '...' : ''}\` |` : ''}
+            | **VM Host** | \`${vmHost}\` |
+            | **App Path** | \`${vmAppPath}\` |
             | **Service Status** | ${healthDisplay} |
             `;
 
             if (jobStatus === 'success') {
               comment += `\n---\n#### 🌐 Access Information\n`;
-              comment += `**URL:** http://localhost:${port}/\n`;
+              comment += `**VM:** ${vmHost}\n`;
               comment += `**Workflow Run:** [View Logs](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n`;
             } else {
               comment += `\n---\n#### ⚠️ Action Required\n`;
@@ -1518,8 +1410,8 @@ jobs:
         with:
           script: |
             const deploymentId = Number('${{ steps.create_deployment.outputs.deployment_id }}');
-            const environment = '${{ steps.validate.outputs.environment }}';
-            const action = '${{ steps.validate.outputs.action }}';
+            const environment = '${{ needs.validate.outputs.environment }}';
+            const action = '${{ needs.validate.outputs.action }}';
             const finalSha = '${{ steps.determine_sha.outputs.final_sha }}';
             const currentSha = '${{ steps.determine_current.outputs.current_sha }}';
             const jobStatus = '${{ job.status }}';
@@ -1553,8 +1445,8 @@ jobs:
             // Sanitize description
             description = sanitize(description);
 
-            const port = environment === 'staging' ? process.env.STAGING_PORT : process.env.PROD_PORT;
-            const environmentUrl = `http://localhost:${port}/`;
+            const vmHost = process.env.VM_HOST;
+            const environmentUrl = `http://${vmHost}/${environment}`;
             const logUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
             await github.rest.repos.createDeploymentStatus({
@@ -1570,3 +1462,13 @@ jobs:
             });
 
             core.info(`Deployment status updated: ${state}`);
+
+      # STEP 10: Update Deployment History Wiki
+      # Updates the GitHub Wiki with deployment history after successful deployment
+      # Only runs if the deployment was successful
+      - name: Update Deployment History Wiki
+        if: success() && steps.create_deployment.outputs.deployment_id
+        uses: ./.github/actions/update-deployment-wiki
+        with:
+          wiki-token: ${{ secrets.WIKI_TOKEN }}
+          github-repository: ${{ github.repository }}

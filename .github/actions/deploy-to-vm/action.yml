@@ -1,0 +1,145 @@
+name: 'Deploy to VM'
+description: 'Deploys application to VM via SSH with health checks'
+author: 'CI/CD Team'
+
+# This composite action encapsulates the complete VM deployment procedure
+# It is designed to be portable and reusable across repositories
+
+inputs:
+  commit-sha:
+    description: 'Commit SHA to deploy'
+    required: true
+  environment:
+    description: 'Target environment (staging or production)'
+    required: true
+  vm-host:
+    description: 'VM hostname or IP address'
+    required: true
+  vm-user:
+    description: 'SSH username for VM access'
+    required: true
+  vm-app-path:
+    description: 'Application path on VM'
+    required: true
+  vm-service-name:
+    description: 'Systemd service name to restart'
+    required: true
+  app-port:
+    description: 'Application port number'
+    required: true
+  api-key:
+    description: 'API key for application .env file'
+    required: true
+  db-host:
+    description: 'Database host for application .env file'
+    required: true
+  deployment-id:
+    description: 'Unique deployment ID (typically github.run_id)'
+    required: true
+
+outputs:
+  deployment-status:
+    description: 'Deployment status: deployed, failed, or skipped'
+    value: ${{ steps.deploy.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Deploy to VM via SSH
+      id: deploy
+      shell: bash
+      env:
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        VM_HOST: ${{ inputs.vm-host }}
+        VM_USER: ${{ inputs.vm-user }}
+        VM_APP_PATH: ${{ inputs.vm-app-path }}
+        VM_SERVICE_NAME: ${{ inputs.vm-service-name }}
+        APP_PORT: ${{ inputs.app-port }}
+        API_KEY: ${{ inputs.api-key }}
+        DB_HOST: ${{ inputs.db-host }}
+        DEPLOYMENT_ID: ${{ inputs.deployment-id }}
+      run: |
+        set -euo pipefail
+
+        echo "Runner: $(hostname)"
+        echo "GitHub SHA: ${COMMIT_SHA}"
+        echo "VM: ${VM_HOST}"
+        echo ""
+        echo "🚀 Starting ${ENVIRONMENT} deployment..."
+        echo "📍 Commit SHA: ${COMMIT_SHA}"
+        echo "🏷️  Environment: ${ENVIRONMENT}"
+        echo "🖥️  VM Host: ${VM_HOST}"
+        echo "📁 App Path: ${VM_APP_PATH}"
+
+        # Validate SHA format before SSH
+        if ! [[ "${COMMIT_SHA}" =~ ^[a-f0-9]{40}$ ]]; then
+          echo "❌ ERROR: Invalid SHA format: ${COMMIT_SHA}"
+          exit 1
+        fi
+
+        # SSH into VM and deploy using exact commit SHA
+        echo "🔐 Connecting to VM via SSH..."
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${VM_USER}@${VM_HOST} "bash -s" <<EOF
+        set -euo pipefail
+
+        cd ${VM_APP_PATH}
+
+        echo "🔧 Configuring git safe directory..."
+        git config --global --add safe.directory ${VM_APP_PATH}
+
+        echo "📥 Fetching latest code from origin..."
+        git fetch --prune --tags origin
+
+        echo "🧹 Cleaning working directory..."
+        git reset --hard
+        git clean -fd
+
+        echo "📍 Checking out commit SHA: ${COMMIT_SHA}"
+        git checkout ${COMMIT_SHA}
+
+        echo "📝 Writing environment variables..."
+        cat > ${VM_APP_PATH}/.env <<ENV_FILE
+        ENVIRONMENT=${ENVIRONMENT}
+        DEPLOYMENT_ID=${DEPLOYMENT_ID}
+        API_KEY=${API_KEY}
+        DB_HOST=${DB_HOST}
+        PORT=${APP_PORT}
+        COMMIT_SHA=${COMMIT_SHA}
+        ENV_FILE
+
+        echo "🔄 Restarting service..."
+        sudo systemctl restart ${VM_SERVICE_NAME}
+
+        echo "⏳ Waiting for service to initialize..."
+        sleep 3
+
+        echo "🏥 Checking health endpoint..."
+        MAX_RETRIES=10
+        RETRY_DELAY=2
+        RETRY_COUNT=0
+
+        while [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; do
+          if curl -f -s http://localhost:${APP_PORT}/ >/dev/null 2>&1; then
+            echo "✅ Health check passed"
+            break
+          fi
+          RETRY_COUNT=\$((RETRY_COUNT + 1))
+          if [ \$RETRY_COUNT -lt \$MAX_RETRIES ]; then
+            echo "⏳ Health check attempt \$RETRY_COUNT/\$MAX_RETRIES failed, retrying in \${RETRY_DELAY}s..."
+            sleep \$RETRY_DELAY
+          else
+            echo "❌ Health check failed after \$MAX_RETRIES attempts"
+            exit 1
+          fi
+        done
+
+        echo "✅ Deployment complete!"
+        EOF
+
+        # Set deployment status
+        echo "status=deployed" >> $GITHUB_OUTPUT
+
+        echo "✅ ${ENVIRONMENT} deployment successful"
+        echo "📍 Commit: ${COMMIT_SHA}"
+        echo "🖥️  VM: ${VM_HOST}"
