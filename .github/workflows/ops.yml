@@ -120,7 +120,7 @@ jobs:
       # GitHub Actions best practice: Check out repository at the start of the job
       # This ensures all composite actions under .github/actions/ are available throughout the workflow
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
@@ -141,7 +141,7 @@ jobs:
       # Enforces authorization allowlists
       - name: Validate and Parse Ops Trigger
         id: validate
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             // Detect trigger source
@@ -344,7 +344,7 @@ jobs:
       # Runs if validation step completed but operation was rejected
       - name: Post Validation Failure
         if: always() && steps.validate.outputs.should_run == 'false' && steps.validate.outputs.error_message != ''
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const errorMessage = ${{ toJSON(steps.validate.outputs.error_message) }};
@@ -379,7 +379,7 @@ jobs:
       - name: Resolve Ref to SHA
         id: resolve_sha
         if: steps.validate.outputs.target_sha != ''
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const inputRef = '${{ steps.validate.outputs.target_sha }}';
@@ -498,7 +498,7 @@ jobs:
       # STEP 4: Post ref resolution failure message
       - name: Post Ref Resolution Failure
         if: always() && steps.resolve_sha.outcome == 'failure'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const errorMessage = ${{ toJSON(steps.resolve_sha.outputs.error_message) }};
@@ -581,7 +581,7 @@ jobs:
           steps.validate.outputs.action == 'rollback' &&
           steps.validate.outputs.target_sha == '' &&
           steps.resolve_sha.outcome == 'skipped'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const environment = '${{ steps.validate.outputs.environment }}';
@@ -831,7 +831,7 @@ jobs:
       # Provides immediate feedback to Ops Console about coverage requirements
       - name: Post Coverage Gate Failure
         if: always() && steps.verify_coverage.outcome == 'failure'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const errorMessage = ${{ toJSON(steps.verify_coverage.outputs.error_message) }};
@@ -898,7 +898,7 @@ jobs:
           steps.validate.outputs.environment == 'production' &&
           steps.validate.outputs.action == 'redeploy' &&
           steps.determine_sha.outputs.final_sha != ''
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const targetSha = '${{ steps.determine_sha.outputs.final_sha }}';
@@ -978,7 +978,7 @@ jobs:
       # Provides immediate feedback to Ops Console
       - name: Post Staging Verification Failure (Ops)
         if: always() && steps.verify_staging.outcome == 'failure'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const errorMessage = ${{ toJSON(steps.verify_staging.outputs.error_message) }};
@@ -1052,7 +1052,7 @@ jobs:
     steps:
       # STEP 0: Checkout repository for composite actions
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
@@ -1061,7 +1061,7 @@ jobs:
       - name: Create GitHub Deployment
         id: create_deployment
         if: needs.validate.outputs.should_run == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const environment = '${{ needs.validate.outputs.environment }}';
@@ -1321,7 +1321,7 @@ jobs:
       # Posts result to Ops Console issue
       - name: Post Ops Status Comment
         if: always() && needs.validate.outputs.should_run == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const action = '${{ needs.validate.outputs.action }}';
@@ -1406,7 +1406,7 @@ jobs:
       # Updates the deployment record with final status
       - name: Update Deployment Status
         if: always() && steps.create_deployment.outputs.deployment_id
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const deploymentId = Number('${{ steps.create_deployment.outputs.deployment_id }}');
