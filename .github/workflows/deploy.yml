@@ -61,7 +61,7 @@ jobs:
       # GitHub Actions best practice: Check out repository at the start of the job
       # This ensures all composite actions under .github/actions/ are available throughout the workflow
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -511,7 +511,7 @@ jobs:
     steps:
       # STEP 0: Checkout repository for composite actions
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -569,7 +569,7 @@ jobs:
       # NEVER use git pull - always checkout specific commit
       # This ensures we deploy exactly what was validated, not what's currently on the branch
       - name: Checkout PR HEAD commit (exact SHA)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.validate.outputs.pr_sha }}
           fetch-depth: 1

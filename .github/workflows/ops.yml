@@ -120,7 +120,7 @@ jobs:
       # GitHub Actions best practice: Check out repository at the start of the job
       # This ensures all composite actions under .github/actions/ are available throughout the workflow
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -1052,7 +1052,7 @@ jobs:
     steps:
       # STEP 0: Checkout repository for composite actions
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
